@@ -2,6 +2,8 @@
 
 Institutional-style Python backtest for a constituent-level VOO trend-following strategy.
 
+Repository: `https://github.com/Aroesler1/voo-constituent-sma-backtest`
+
 The strategy evaluates the holdings underlying `VOO` on a point-in-time basis and holds only constituents trading above their `200-day SMA`, allocating capital equally across active names and routing the remainder to cash when breadth collapses.
 
 ## What This Project Does
