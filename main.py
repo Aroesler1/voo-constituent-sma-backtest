@@ -44,6 +44,7 @@ from reporting import (
     print_summary_table,
     write_detailed_report,
 )
+from statistics_mt import deflated_sharpe, per_period_sharpe
 from strategy import compute_sma_matrix, generate_active_mask
 
 LOGGER = logging.getLogger(__name__)
@@ -1058,6 +1059,7 @@ def main() -> None:
         adv_lookback=config.ADV_LOOKBACK_DAYS,
         vol_lookback=config.VOL_LOOKBACK_DAYS,
         spread_model=config.SPREAD_MODEL,
+        open_df=open_df,
     )
 
     tradable_sanity_mask = membership.reindex(index=trading_index, columns=valid_cols).fillna(False)
@@ -1220,6 +1222,7 @@ def main() -> None:
     # 11) Optional SMA-length sweep (default schedule)
     default_calendar = build_rebalance_calendar(trading_index, config.REBALANCE_DEFAULT)
     sma_rows: list[dict[str, Any]] = []
+    sweep_excess_returns: list[pd.Series] = []
     for sma_len in config.SMA_SWEEP_VALUES:
         LOGGER.info("Running SMA sweep length: %s", sma_len)
         sma_i = compute_sma_matrix(close_df, int(sma_len))
@@ -1251,6 +1254,9 @@ def main() -> None:
             eligible_count=res_i.get("eligible_count"),
             exposure=res_i.get("exposure"),
         )
+        sweep_excess_returns.append(
+            res_i["period_returns"] - effective_cash_rate / 252.0
+        )
         sma_rows.append(
             {
                 "sma_length": int(sma_len),
@@ -1266,6 +1272,29 @@ def main() -> None:
         gc.collect()
 
     sma_sweep_df = pd.DataFrame(sma_rows)
+
+    # Deflated Sharpe (Bailey / Lopez de Prado) for every sweep configuration.
+    # The multiple-testing pool counts every configuration this run evaluates:
+    # the SMA grid plus the rebalance-schedule sweep. Cross-trial Sharpe
+    # dispersion comes from the SMA sweep's own daily excess returns.
+    if sweep_excess_returns:
+        trial_sharpes = [per_period_sharpe(s) for s in sweep_excess_returns]
+        n_trials = len(config.SMA_SWEEP_VALUES) + len(config.REBALANCE_SWEEP_VALUES)
+        sma_sweep_df["deflated_sharpe"] = [
+            deflated_sharpe(s, n_trials=n_trials, trial_sharpes=trial_sharpes)
+            for s in sweep_excess_returns
+        ]
+        strategy_excess = (
+            strategy_res["period_returns"] - effective_cash_rate / 252.0
+        )
+        strategy_metrics["deflated_sharpe"] = deflated_sharpe(
+            strategy_excess, n_trials=n_trials, trial_sharpes=trial_sharpes
+        )
+        LOGGER.info(
+            "Deflated Sharpe (n_trials=%s): strategy=%.3f",
+            n_trials,
+            strategy_metrics["deflated_sharpe"],
+        )
 
     # 12) Summary tables + decomposition
     summary_metrics = {
