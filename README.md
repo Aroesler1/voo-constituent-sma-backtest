@@ -1,8 +1,17 @@
 # VOO Constituent SMA Backtest
 
-Institutional-style Python backtest for a constituent-level VOO trend-following strategy.
+Institutional-style Python backtest for a constituent-level VOO trend-following strategy, built to research-grade data standards rather than around a strategy claim.
 
 Repository: `https://github.com/Aroesler1/voo-constituent-sma-backtest`
+
+## What it does
+
+- **Point-in-time universe construction** from CRSP, with S&P membership history and delisting returns compounded into the final return of names that exit
+- **Retail-implementable cost model**: EDGE effective spreads (Ardia, Guidotti & Kroencke, JFE 2024), opening-auction slippage, participation-based impact, and FINRA regulatory fees
+- **Multiple-testing-aware validation**: Deflated Sharpe Ratio over the SMA-length sweep, with the full configuration grid as the trial pool
+- **A universe integrity audit** (`audit_universe.py`) that checks the CRSP ticker→PERMNO mapping is point-in-time correct, and a resolver (`permno_resolution.py`) that fixes it
+
+That last item is what this repository is currently most useful for. The strategy is a 200-day SMA — deliberately simple. The infrastructure around it is the substance, and running the audit against it produced the finding below.
 
 > ### Results are being regenerated after a data-integrity audit
 >
