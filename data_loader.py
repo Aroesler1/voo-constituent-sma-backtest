@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import time
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -26,6 +27,20 @@ CRSP_COMMON_SHARE_CODES = (10, 11, 12, 18, 40, 41, 42, 48, 70, 71, 72)
 
 def _parse_date(value: str) -> pd.Timestamp:
     return pd.Timestamp(value).normalize()
+
+
+# Query parameters whose values are credentials. requests resolves params into
+# the final URL, and HTTPError carries that URL in its message, so an
+# unscrubbed exception or warning leaks the vendor key into logs and CI output.
+_SECRET_QUERY_KEYS = ("api_token", "api_key", "apikey", "token", "password", "secret")
+_SECRET_RE = re.compile(
+    r"(?i)\b(" + "|".join(_SECRET_QUERY_KEYS) + r")=[^&\s\"'>]+"
+)
+
+
+def _redact(value: Any) -> str:
+    """Strip credential values out of URLs and error strings before logging."""
+    return _SECRET_RE.sub(r"\1=<redacted>", str(value))
 
 
 def _request_json_with_retries(
@@ -58,12 +73,16 @@ def _request_json_with_retries(
                 "Request failed (attempt %s/%s): %s. Retrying in %ss",
                 attempt,
                 retries,
-                exc,
+                _redact(exc),
                 delay,
             )
             time.sleep(delay)
 
-    raise RuntimeError(f"Failed request after {retries} attempts: {url}") from last_err
+    # `from None` deliberately drops the chained cause: requests' HTTPError
+    # message contains the resolved URL including the API token.
+    raise RuntimeError(
+        f"Failed request after {retries} attempts: {_redact(url)} ({_redact(last_err)})"
+    ) from None
 
 
 def _request_text_with_retries(
@@ -95,12 +114,14 @@ def _request_text_with_retries(
                 "Text request failed (attempt %s/%s): %s. Retrying in %ss",
                 attempt,
                 retries,
-                exc,
+                _redact(exc),
                 delay,
             )
             time.sleep(delay)
 
-    raise RuntimeError(f"Failed request after {retries} attempts: {url}") from last_err
+    raise RuntimeError(
+        f"Failed request after {retries} attempts: {_redact(url)} ({_redact(last_err)})"
+    ) from None
 
 
 def _ensure_cache_dirs(cache_dir: Path) -> None:
@@ -549,7 +570,19 @@ def _get_wrds_connection(
         kwargs["wrds_username"] = username
     if password:
         kwargs["wrds_password"] = password
-    return wrds.Connection(**kwargs)
+    try:
+        return wrds.Connection(**kwargs)
+    except EOFError as exc:
+        # wrds falls back to an interactive input() prompt whenever its own
+        # connect() fails (stale ~/.pgpass, expired password, MFA). Under any
+        # non-interactive caller -- CI, a background run, a notebook kernel --
+        # that surfaces as a bare EOFError, which reads like a bug in this
+        # repo rather than an expired credential. Translate it.
+        raise RuntimeError(
+            "WRDS authentication failed and cannot prompt in a non-interactive "
+            "session. Refresh ~/.pgpass or set WRDS_USERNAME/WRDS_PASSWORD, then "
+            "retry. Cached snapshots are still served without a connection."
+        ) from exc
 
 
 def _normalize_crsp_daily(df: pd.DataFrame) -> pd.DataFrame:
@@ -820,7 +853,19 @@ def fetch_crsp_batch_prices(
         LOGGER.warning("CRSP requested but WRDS username is missing; falling back for %s tickers.", len(missing))
         return out
 
-    conn = _get_wrds_connection(username=user, password=secret)
+    try:
+        conn = _get_wrds_connection(username=user, password=secret)
+    except (RuntimeError, ImportError) as exc:
+        # Degrade to cache rather than losing an otherwise complete run: the
+        # caller's coverage gate decides whether what we have is sufficient.
+        LOGGER.warning(
+            "WRDS unavailable (%s); serving %s cached ticker(s), %s uncached.",
+            exc,
+            len(out),
+            len(missing),
+        )
+        return out
+
     try:
         for batch_start in range(0, len(missing), int(cfg.CRSP_BATCH_SIZE)):
             chunk = missing[batch_start : batch_start + int(cfg.CRSP_BATCH_SIZE)]

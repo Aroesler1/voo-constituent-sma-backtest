@@ -62,10 +62,16 @@ Default reporting schedule is `semi_monthly`, with full comparisons against `dai
 - Time-varying cash sleeve using `DGS3MO`
 - Retail-implementable cost model:
   - opening-auction slippage
-  - Corwin-Schultz spread estimate
+  - EDGE spread estimator (Ardia, Guidotti, Kroencke, JFE 2024) by default, Corwin-Schultz retained for comparison
   - participation-based impact
   - FINRA sell-side regulatory fee support
 - Output manifests for deterministic reruns
+
+## Statistical Honesty
+
+- The SMA-length sweep and schedule comparison constitute a multiple-testing search, so the report includes the Deflated Sharpe Ratio (Bailey and Lopez de Prado 2014) for the selected configuration and for every sweep entry, with the full sweep treated as the trial pool. A high raw Sharpe with a low deflated Sharpe means the configuration choice is not statistically distinguishable from picking the best of several noise strategies.
+- Trade-level profit concentration (`profit_top5pct_share`, `profit_top10pct_share`) is reported because single-stock trend following concentrates most profit in a small tail of trades; averages alone hide this dependence.
+- CRSP delisting returns (`dsedelist.dlret`) are compounded into the final return of names that exit, so departures do not silently leave at their last quoted price.
 
 ## Known Limits
 
@@ -101,6 +107,12 @@ From the project root:
 
 ```bash
 ./.venv/bin/python main.py
+```
+
+Run the unit tests (no credentials required):
+
+```bash
+./.venv/bin/python -m pytest tests -q
 ```
 
 ## Generated Outputs

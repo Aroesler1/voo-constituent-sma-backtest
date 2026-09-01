@@ -287,8 +287,16 @@ def compute_daily_liquidity_feature_matrices(
     adv_lookback: int,
     vol_lookback: int,
     spread_model: str,
+    open_df: pd.DataFrame | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Compute daily liquidity feature matrices for multi-asset cost modeling."""
+    """Compute daily liquidity feature matrices for multi-asset cost modeling.
+
+    ``spread_model`` selects the effective-spread estimator:
+      - ``edge`` (default in config): Ardia-Guidotti-Kroencke (JFE 2024)
+        estimator from OHLC; unbiased with overnight returns and more
+        efficient than high-low estimators. Requires ``open_df``.
+      - ``corwin_schultz``: legacy high-low estimator, kept for comparison.
+    """
     common_cols = sorted(set(price_df.columns) & set(volume_df.columns) & set(high_df.columns) & set(low_df.columns))
     if not common_cols:
         raise ValueError("No common columns across price/volume/high/low matrices.")
@@ -301,12 +309,20 @@ def compute_daily_liquidity_feature_matrices(
     adv_usd = (px * vol).rolling(adv_lookback).mean().astype(FLOAT_DTYPE)
     sigma_20d = np.log(px / px.shift(1)).rolling(vol_lookback).std().astype(FLOAT_DTYPE)
 
-    spread_bps = pd.DataFrame(index=px.index, columns=common_cols, dtype=FLOAT_DTYPE)
-    if spread_model.lower() != "corwin_schultz":
-        raise ValueError("Only spread_model='corwin_schultz' is supported.")
+    model = spread_model.lower()
+    if model == "edge":
+        if open_df is None:
+            raise ValueError("spread_model='edge' requires open_df.")
+        from spread_edge import edge_spread_matrix
 
-    for ticker in common_cols:
-        spread_bps[ticker] = (_corwin_schultz_spread(hi[ticker], lo[ticker]) * 10000.0).astype(FLOAT_DTYPE)
+        op = open_df[common_cols].astype(FLOAT_DTYPE)
+        spread_bps = (edge_spread_matrix(op, hi, lo, px) * 10000.0).astype(FLOAT_DTYPE)
+    elif model == "corwin_schultz":
+        spread_bps = pd.DataFrame(index=px.index, columns=common_cols, dtype=FLOAT_DTYPE)
+        for ticker in common_cols:
+            spread_bps[ticker] = (_corwin_schultz_spread(hi[ticker], lo[ticker]) * 10000.0).astype(FLOAT_DTYPE)
+    else:
+        raise ValueError("spread_model must be 'edge' or 'corwin_schultz'.")
 
     return {
         "adv_usd": adv_usd.astype(FLOAT_DTYPE),
