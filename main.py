@@ -496,13 +496,13 @@ def _fetch_single_price_with_fallback(
     end: str,
     config: BacktestConfig,
 ) -> tuple[pd.DataFrame, str]:
-    """Fetch one benchmark series using CRSP first when configured, then EODHD."""
-    benchmark_etfs = {"VOO", "SPY"}
-    if ticker.upper() in benchmark_etfs:
-        if not config.EODHD_API_KEY:
-            raise ValueError(f"EODHD_API_KEY is required for benchmark ETF {ticker}.")
-        return fetch_eodhd(ticker, start, end, config.EODHD_API_KEY), "eodhd"
+    """Fetch one benchmark series using CRSP first when configured, then EODHD.
 
+    Benchmark ETFs used to short-circuit straight to EODHD, which contradicted
+    this docstring and made the whole run fail hard whenever the EODHD key was
+    absent or rejected -- even with a complete CRSP series already cached. They
+    now follow the same CRSP-first, EODHD-fallback path as any other ticker.
+    """
     if config.PRIMARY_PRICE_SOURCE == "crsp" and config.has_crsp_credentials():
         try:
             crsp_map = fetch_crsp_batch_prices(
@@ -514,15 +514,27 @@ def _fetch_single_price_with_fallback(
                 api_key=config.CRSP_API_KEY,
             )
             if ticker in crsp_map and not crsp_map[ticker].empty:
-                if not _needs_recent_tail(crsp_map[ticker], end) or not config.EODHD_API_KEY:
-                    return crsp_map[ticker], "crsp"
+                crsp_df = crsp_map[ticker]
+                if not _needs_recent_tail(crsp_df, end) or not config.EODHD_API_KEY:
+                    return crsp_df, "crsp"
                 LOGGER.warning(
                     "CRSP coverage for %s ends at %s; extending with EODHD.",
                     ticker,
-                    _max_available_date(crsp_map[ticker]).date().isoformat(),
+                    _max_available_date(crsp_df).date().isoformat(),
                 )
-                eod_df = fetch_eodhd(ticker, start, end, config.EODHD_API_KEY)
-                return _merge_price_frames(crsp_map[ticker], eod_df), "crsp+eodhd"
+                try:
+                    eod_df = fetch_eodhd(ticker, start, end, config.EODHD_API_KEY)
+                except Exception as exc:
+                    # an expired or rate-limited vendor key must not discard an
+                    # otherwise complete CRSP history; serve what we have and
+                    # let the coverage gate decide whether the tail is required
+                    LOGGER.warning(
+                        "EODHD tail extension failed for %s (%s); using CRSP only.",
+                        ticker,
+                        exc,
+                    )
+                    return crsp_df, "crsp"
+                return _merge_price_frames(crsp_df, eod_df), "crsp+eodhd"
         except Exception as exc:
             LOGGER.warning("CRSP benchmark fetch failed for %s: %s", ticker, exc)
 
