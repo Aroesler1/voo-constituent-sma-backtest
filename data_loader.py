@@ -23,6 +23,10 @@ from config import BacktestConfig, load_config
 LOGGER = logging.getLogger(__name__)
 CRSP_SNAPSHOT_SCHEMA_VERSION = 3
 CRSP_COMMON_SHARE_CODES = (10, 11, 12, 18, 40, 41, 42, 48, 70, 71, 72)
+# Share codes for funds and ETFs. Deliberately excluded from a constituent
+# universe -- an index strategy must not accidentally hold the index itself --
+# but required when a benchmark ETF such as SPY or VOO is requested BY NAME.
+CRSP_FUND_SHARE_CODES = (73,)
 
 
 def _parse_date(value: str) -> pd.Timestamp:
@@ -689,10 +693,17 @@ def _resolve_crsp_name_history(
     tickers: list[str],
     start: str,
     end: str,
+    include_funds: bool = False,
 ) -> pd.DataFrame:
-    """Resolve date-aware CRSP name history rows for requested tickers."""
+    """Resolve date-aware CRSP name history rows for requested tickers.
+
+    `include_funds` admits ETF share codes. It is off by default so a
+    constituent universe never picks up a fund through an accidental ticker
+    match, and switched on only for benchmark tickers requested explicitly.
+    """
     tickers_sql = ", ".join(f"'{ticker}'" for ticker in tickers)
-    share_codes_sql = ", ".join(str(code) for code in CRSP_COMMON_SHARE_CODES)
+    codes = CRSP_COMMON_SHARE_CODES + (CRSP_FUND_SHARE_CODES if include_funds else ())
+    share_codes_sql = ", ".join(str(code) for code in codes)
     variants = [
         """
         SELECT
@@ -809,8 +820,14 @@ def fetch_crsp_batch_prices(
     username: str | None = None,
     password: str | None = None,
     api_key: str | None = None,
+    include_funds: bool = False,
 ) -> dict[str, pd.DataFrame]:
-    """Fetch CRSP daily data via WRDS in batches, with snapshot reuse and per-ticker caching."""
+    """Fetch CRSP daily data via WRDS in batches, with snapshot reuse and per-ticker caching.
+
+    `include_funds` admits ETF share codes and must be set explicitly. A
+    constituent universe leaves it off so an index strategy cannot accidentally
+    hold the index itself; a benchmark request for SPY or VOO turns it on.
+    """
     cfg = load_config()
     cache_dir = Path(cfg.CACHE_DIR)
     _ensure_cache_dirs(cache_dir)
@@ -869,7 +886,8 @@ def fetch_crsp_batch_prices(
     try:
         for batch_start in range(0, len(missing), int(cfg.CRSP_BATCH_SIZE)):
             chunk = missing[batch_start : batch_start + int(cfg.CRSP_BATCH_SIZE)]
-            name_history = _resolve_crsp_name_history(conn, chunk, start, end)
+            name_history = _resolve_crsp_name_history(
+                conn, chunk, start, end, include_funds=include_funds)
             if name_history.empty:
                 LOGGER.warning("CRSP permno resolution returned no matches for chunk starting with %s.", chunk[0])
                 continue
