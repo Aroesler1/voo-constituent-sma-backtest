@@ -13,22 +13,48 @@ Repository: `https://github.com/Aroesler1/voo-constituent-sma-backtest`
 
 That last item is what this repository is currently most useful for. The strategy is a 200-day SMA — deliberately simple. The infrastructure around it is the substance, and running the audit against it produced the finding below.
 
-> ### Results are being regenerated after a data-integrity audit
->
-> An audit of the cached CRSP universe found that **437 of 1,153 tickers (38%) resolve to more than one PERMNO**. CRSP tickers are reused across companies and collide across share classes, and this loader resolved ticker to PERMNO without a point-in-time constraint, so a single "ticker" series could splice unrelated securities together.
->
-> Two distinct failure modes, both confirmed:
->
-> - **Sequential reuse: 327 tickers (28.4%) whose segments are separated by more than a year.** `SOLV` has a **26.7-year gap** between its two securities. The cached `VOO` series splices PERMNO 86379 (1998-2010, an unrelated company that held the ticker) onto 12305 (the actual Vanguard ETF, from 2010). A 200-day SMA spanning such a boundary averages two different companies' prices, so the signal is corrupted, not merely one return.
-> - **Simultaneous share classes: 23 tickers with duplicate dates** (TAP, BIO, MKC, STZ, LEN, CBS, CNP). These raise inside `_extract_adjusted_series`; the exception is swallowed by a bare `except Exception` logged at DEBUG only, so the ticker is **silently dropped from the universe** - invisible selection bias in a repo whose premise is point-in-time discipline.
->
-> **Every performance number below predates this audit and should not be relied on.** The fix is to resolve ticker to PERMNO as of each date via `crsp.dsenames` (`namedt`/`nameendt`), treat each PERMNO as a distinct instrument, and never concatenate across PERMNOs. Regeneration is blocked only on restoring WRDS access.
->
-> Reproduce the audit yourself against any cache directory:
->
-> ```bash
-> python audit_universe.py --cache-dir data_cache
-> ```
+## Regenerated results (2026-09): the strategy loses to the index
+
+Rerun after the data-integrity audit below, on 1,148 CRSP-resolved constituents, 7,300 trading days, 21,836 trades.
+
+| metric | Strategy | S&P 500 total return |
+|---|---|---|
+| CAGR | 8.40% | **9.98%** |
+| Annualised volatility | 16.85% | 19.27% |
+| Sharpe | 0.363 | **0.399** |
+| Max drawdown | 54.4% | 55.2% |
+| Annual turnover | 4.54 | 0.03 |
+| Annualised cost | **758 bps** | 0 |
+
+**The strategy underperforms simply holding the index, and does not reduce drawdown to compensate** (54.4% against 55.2%). Costs are the mechanism: 14.9 bps per trade at 4.5x annual turnover compounds to 758 bps a year, which is more than the entire gap to the benchmark.
+
+The Deflated Sharpe over the 9-configuration sweep is 0.985, meaning the *selected configuration* is unlikely to be the best of nine noise strategies. That is worth stating precisely: it says the configuration search did not manufacture the result. It does not say the result is good, and here it is not.
+
+This is the expected outcome for a 200-day SMA on index constituents, and it is reported rather than buried. The contribution of this repository is the infrastructure and the audit, not the strategy.
+
+### Caveats on these numbers
+
+- **Coverage gap.** 547 of 1,695 universe tickers did not resolve through CRSP and would previously have come from a vendor fallback whose key is no longer valid. The run continues on the 1,148 that did resolve, so the universe is incomplete and skewed toward names with clean CRSP ticker history.
+- **The buy-and-hold column in the raw output is unreliable.** It reports a 2.86% CAGR, which is implausible for the period; the ETF benchmark has CRSP coverage only from late 2014 and the contaminated cache for it was quarantined. Compare against the S&P 500 total-return column instead.
+- Pre-2019 constituent history remains proxy-based rather than a licensed point-in-time master.
+
+## The universe audit that prompted the rerun
+
+An audit of the cached CRSP universe found that **437 of 1,153 tickers (38%) resolve to more than one PERMNO**. CRSP tickers are reused across companies and collide across share classes, and this loader resolved ticker to PERMNO without a point-in-time constraint, so a single "ticker" series could splice unrelated securities together.
+
+Two distinct failure modes, both confirmed:
+
+- **Sequential reuse: 327 tickers (28.4%) whose segments are separated by more than a year.** `SOLV` has a **26.7-year gap** between its two securities. The cached `VOO` series spliced **Vornado Operating Co** (permno 86379, common stock, 1998-2003) onto the **Vanguard S&P 500 ETF** (permno 12305, share code 73, 2014-2024). A 200-day SMA spanning such a boundary averages two different companies' prices, so the signal is corrupted, not merely one return.
+- **Simultaneous share classes: 23 tickers with duplicate dates** (TAP, BIO, MKC, STZ, LEN, CBS, CNP). These raise inside `_extract_adjusted_series`; the exception is swallowed by a bare `except Exception` logged at DEBUG only, so the ticker is **silently dropped from the universe** - invisible selection bias.
+
+Quantified with `quantify_contamination.py`: 288,281 of 6,198,577 rows (4.7%) fail point-in-time filtering, 27,474 returns are fabricated across splices, and 2,486 of those exceed 50% in a single day. The 200-day signal itself disagrees on only 0.01% of ticker-days, but returns above 200% still reach the P&L matrix.
+
+Reproduce both:
+
+```bash
+python audit_universe.py --cache-dir data_cache
+python quantify_contamination.py
+```
 
 The strategy evaluates the holdings underlying `VOO` on a point-in-time basis and holds only constituents trading above their `200-day SMA`, allocating capital equally across active names and routing the remainder to cash when breadth collapses.
 
