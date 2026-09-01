@@ -21,3 +21,6 @@ output/
 
 # run logs may contain vendor API tokens in error URLs
 logs/
+
+data/universe/dsenames.parquet
+output/
