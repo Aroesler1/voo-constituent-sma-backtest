@@ -128,6 +128,7 @@ def _matched_round_trips(trade_log: pd.DataFrame) -> pd.DataFrame:
                         "return": px / entry_price - 1.0,
                         "holding_days": max((dt - pd.Timestamp(lot["entry_date"])).days, 0),
                         "qty": matched,
+                        "pnl_usd": (px - entry_price) * matched,
                     }
                 )
             lot["qty"] = float(lot["qty"]) - matched
@@ -198,6 +199,22 @@ def compute_metrics(
     hit_ratio = len(wins) / len(rt) if rt else np.nan
     avg_win = float(np.mean(wins)) if wins else np.nan
     avg_loss = float(np.mean(losses)) if losses else np.nan
+
+    # Profit concentration: share of summed positive trade PnL delivered by
+    # the top 5% / 10% of round trips. Single-stock trend following is known
+    # to concentrate nearly all profit in a small tail of trades; this makes
+    # that dependence visible instead of hiding it behind averages.
+    profit_top5pct_share = np.nan
+    profit_top10pct_share = np.nan
+    if not matched_trades.empty and "pnl_usd" in matched_trades.columns:
+        pnl = pd.to_numeric(matched_trades["pnl_usd"], errors="coerce").dropna()
+        gross_profit = float(pnl[pnl > 0].sum())
+        if len(pnl) >= 20 and gross_profit > 0:
+            ranked = pnl.sort_values(ascending=False)
+            n5 = max(int(np.ceil(len(ranked) * 0.05)), 1)
+            n10 = max(int(np.ceil(len(ranked) * 0.10)), 1)
+            profit_top5pct_share = float(ranked.iloc[:n5].clip(lower=0).sum() / gross_profit)
+            profit_top10pct_share = float(ranked.iloc[:n10].clip(lower=0).sum() / gross_profit)
 
     if not matched_trades.empty:
         avg_holding_period_weeks = float(matched_trades["holding_days"].mean() / 7.0)
@@ -281,6 +298,8 @@ def compute_metrics(
         "hit_ratio": float(hit_ratio) if pd.notna(hit_ratio) else np.nan,
         "avg_win": float(avg_win) if pd.notna(avg_win) else np.nan,
         "avg_loss": float(avg_loss) if pd.notna(avg_loss) else np.nan,
+        "profit_top5pct_share": float(profit_top5pct_share) if pd.notna(profit_top5pct_share) else np.nan,
+        "profit_top10pct_share": float(profit_top10pct_share) if pd.notna(profit_top10pct_share) else np.nan,
         "avg_holding_period_weeks": float(avg_holding_period_weeks) if pd.notna(avg_holding_period_weeks) else np.nan,
         "total_trades": float(total_trades),
         "annual_turnover": float(annual_turnover) if pd.notna(annual_turnover) else np.nan,

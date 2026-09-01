@@ -73,7 +73,9 @@ class BacktestConfig:
     MIN_COMMISSION_PER_ORDER: float = 0.0
     SLIPPAGE_BPS: float = 1.0
     ENABLE_ENHANCED_COST_MODEL: bool = True
-    SPREAD_MODEL: str = "corwin_schultz"
+    # 'edge' = Ardia-Guidotti-Kroencke (JFE 2024) OHLC estimator (default);
+    # 'corwin_schultz' = legacy high-low estimator, kept for comparison
+    SPREAD_MODEL: str = "edge"
     SPREAD_FLOOR_BPS: float = 1.0
     IMPACT_MODEL: str = "sqrt_participation"
     IMPACT_COEF: float = 0.02

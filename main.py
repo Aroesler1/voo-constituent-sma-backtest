@@ -44,6 +44,7 @@ from reporting import (
     print_summary_table,
     write_detailed_report,
 )
+from statistics_mt import deflated_sharpe, per_period_sharpe
 from strategy import compute_sma_matrix, generate_active_mask
 
 LOGGER = logging.getLogger(__name__)
@@ -495,13 +496,13 @@ def _fetch_single_price_with_fallback(
     end: str,
     config: BacktestConfig,
 ) -> tuple[pd.DataFrame, str]:
-    """Fetch one benchmark series using CRSP first when configured, then EODHD."""
-    benchmark_etfs = {"VOO", "SPY"}
-    if ticker.upper() in benchmark_etfs:
-        if not config.EODHD_API_KEY:
-            raise ValueError(f"EODHD_API_KEY is required for benchmark ETF {ticker}.")
-        return fetch_eodhd(ticker, start, end, config.EODHD_API_KEY), "eodhd"
+    """Fetch one benchmark series using CRSP first when configured, then EODHD.
 
+    Benchmark ETFs used to short-circuit straight to EODHD, which contradicted
+    this docstring and made the whole run fail hard whenever the EODHD key was
+    absent or rejected -- even with a complete CRSP series already cached. They
+    now follow the same CRSP-first, EODHD-fallback path as any other ticker.
+    """
     if config.PRIMARY_PRICE_SOURCE == "crsp" and config.has_crsp_credentials():
         try:
             crsp_map = fetch_crsp_batch_prices(
@@ -513,15 +514,27 @@ def _fetch_single_price_with_fallback(
                 api_key=config.CRSP_API_KEY,
             )
             if ticker in crsp_map and not crsp_map[ticker].empty:
-                if not _needs_recent_tail(crsp_map[ticker], end) or not config.EODHD_API_KEY:
-                    return crsp_map[ticker], "crsp"
+                crsp_df = crsp_map[ticker]
+                if not _needs_recent_tail(crsp_df, end) or not config.EODHD_API_KEY:
+                    return crsp_df, "crsp"
                 LOGGER.warning(
                     "CRSP coverage for %s ends at %s; extending with EODHD.",
                     ticker,
-                    _max_available_date(crsp_map[ticker]).date().isoformat(),
+                    _max_available_date(crsp_df).date().isoformat(),
                 )
-                eod_df = fetch_eodhd(ticker, start, end, config.EODHD_API_KEY)
-                return _merge_price_frames(crsp_map[ticker], eod_df), "crsp+eodhd"
+                try:
+                    eod_df = fetch_eodhd(ticker, start, end, config.EODHD_API_KEY)
+                except Exception as exc:
+                    # an expired or rate-limited vendor key must not discard an
+                    # otherwise complete CRSP history; serve what we have and
+                    # let the coverage gate decide whether the tail is required
+                    LOGGER.warning(
+                        "EODHD tail extension failed for %s (%s); using CRSP only.",
+                        ticker,
+                        exc,
+                    )
+                    return crsp_df, "crsp"
+                return _merge_price_frames(crsp_df, eod_df), "crsp+eodhd"
         except Exception as exc:
             LOGGER.warning("CRSP benchmark fetch failed for %s: %s", ticker, exc)
 
@@ -1058,6 +1071,7 @@ def main() -> None:
         adv_lookback=config.ADV_LOOKBACK_DAYS,
         vol_lookback=config.VOL_LOOKBACK_DAYS,
         spread_model=config.SPREAD_MODEL,
+        open_df=open_df,
     )
 
     tradable_sanity_mask = membership.reindex(index=trading_index, columns=valid_cols).fillna(False)
@@ -1220,6 +1234,7 @@ def main() -> None:
     # 11) Optional SMA-length sweep (default schedule)
     default_calendar = build_rebalance_calendar(trading_index, config.REBALANCE_DEFAULT)
     sma_rows: list[dict[str, Any]] = []
+    sweep_excess_returns: list[pd.Series] = []
     for sma_len in config.SMA_SWEEP_VALUES:
         LOGGER.info("Running SMA sweep length: %s", sma_len)
         sma_i = compute_sma_matrix(close_df, int(sma_len))
@@ -1251,6 +1266,9 @@ def main() -> None:
             eligible_count=res_i.get("eligible_count"),
             exposure=res_i.get("exposure"),
         )
+        sweep_excess_returns.append(
+            res_i["period_returns"] - effective_cash_rate / 252.0
+        )
         sma_rows.append(
             {
                 "sma_length": int(sma_len),
@@ -1266,6 +1284,29 @@ def main() -> None:
         gc.collect()
 
     sma_sweep_df = pd.DataFrame(sma_rows)
+
+    # Deflated Sharpe (Bailey / Lopez de Prado) for every sweep configuration.
+    # The multiple-testing pool counts every configuration this run evaluates:
+    # the SMA grid plus the rebalance-schedule sweep. Cross-trial Sharpe
+    # dispersion comes from the SMA sweep's own daily excess returns.
+    if sweep_excess_returns:
+        trial_sharpes = [per_period_sharpe(s) for s in sweep_excess_returns]
+        n_trials = len(config.SMA_SWEEP_VALUES) + len(config.REBALANCE_SWEEP_VALUES)
+        sma_sweep_df["deflated_sharpe"] = [
+            deflated_sharpe(s, n_trials=n_trials, trial_sharpes=trial_sharpes)
+            for s in sweep_excess_returns
+        ]
+        strategy_excess = (
+            strategy_res["period_returns"] - effective_cash_rate / 252.0
+        )
+        strategy_metrics["deflated_sharpe"] = deflated_sharpe(
+            strategy_excess, n_trials=n_trials, trial_sharpes=trial_sharpes
+        )
+        LOGGER.info(
+            "Deflated Sharpe (n_trials=%s): strategy=%.3f",
+            n_trials,
+            strategy_metrics["deflated_sharpe"],
+        )
 
     # 12) Summary tables + decomposition
     summary_metrics = {

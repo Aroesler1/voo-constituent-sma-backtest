@@ -18,3 +18,6 @@ output/
 # OS / parquet temp artifacts
 *.tmp
 *.log
+
+# run logs may contain vendor API tokens in error URLs
+logs/
