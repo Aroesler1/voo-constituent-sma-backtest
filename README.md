@@ -28,6 +28,19 @@ Rerun after the data-integrity audit below, on 1,148 CRSP-resolved constituents,
 
 **The strategy underperforms simply holding the index, and does not reduce drawdown to compensate** (54.4% against 55.2%). Costs are the mechanism: 14.9 bps per trade at 4.5x annual turnover compounds to 758 bps a year, which is more than the entire gap to the benchmark.
 
+### Family-wise error control across the sweep
+
+The Deflated Sharpe asks whether the *selected* configuration beats the expected best of N noise strategies. Romano-Wolf stepwise testing asks a different question: across the whole sweep, which configurations beat the benchmark, holding the probability of **any** false rejection at 5%?
+
+| null hypothesis | configurations significant |
+|---|---|
+| beats cash | **5 of 5** |
+| beats the S&P 500 | **0 of 5** |
+
+That contrast is the point. Tested against cash, every SMA length looks significant — but that says only that equities beat T-bills, which is a null no long-equity strategy can fail. Tested against actually holding the index, none of them clear the bar, and every configuration has a *negative* mean excess return (t between −0.88 and −1.35).
+
+Choosing the weak null would have produced five significant results and a much better-looking repository. The benchmark-relative test is the one reported.
+
 The Deflated Sharpe over the 9-configuration sweep is 0.985, meaning the *selected configuration* is unlikely to be the best of nine noise strategies. That is worth stating precisely: it says the configuration search did not manufacture the result. It does not say the result is good, and here it is not.
 
 This is the expected outcome for a 200-day SMA on index constituents, and it is reported rather than buried. The contribution of this repository is the infrastructure and the audit, not the strategy.
