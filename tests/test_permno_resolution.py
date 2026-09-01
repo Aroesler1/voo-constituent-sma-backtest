@@ -98,3 +98,50 @@ def test_unranked_permnos_sort_last_rather_than_winning_by_accident():
     m = build_membership(_history(), ["TAP"], dates)
     chosen = select_primary(m, pd.DataFrame({"permno": [89346], "rank": [5]}))
     assert int(chosen.iloc[0]["permno"]) == 89346
+
+
+def _history_with_class() -> pd.DataFrame:
+    """CRSP keeps share class in `shrcls`, not in the ticker.
+
+    BRK-B does not appear in `ticker` at all; BRK with shrcls 'B' is the Class B
+    security. A universe built from vendor files, which use the hyphenated form,
+    loses every dual-class name unless the suffix is split off.
+    """
+    return pd.DataFrame([
+        {"permno": 17778, "ticker": "BRK", "namedt": "1996-05-09", "nameendt": "2002-01-01",
+         "shrcd": 11, "exchcd": 1, "shrcls": "A", "tsymbol": "BRKA"},
+        {"permno": 83443, "ticker": "BRK", "namedt": "1996-05-09", "nameendt": "2002-01-01",
+         "shrcd": 11, "exchcd": 1, "shrcls": "B", "tsymbol": "BRKB"},
+        {"permno": 14593, "ticker": "AAPL", "namedt": "1980-12-12", "nameendt": None,
+         "shrcd": 11, "exchcd": 3, "shrcls": "", "tsymbol": "AAPL"},
+    ])
+
+
+def test_split_share_class():
+    from permno_resolution import split_share_class
+    assert split_share_class("BRK-B") == ("BRK", "B")
+    assert split_share_class("BF.B") == ("BF", "B")
+    assert split_share_class("AAPL") == ("AAPL", "")
+    # a hyphen that is not a share class must not be split away
+    assert split_share_class("SOME-LONGSUFFIX") == ("SOME-LONGSUFFIX", "")
+
+
+def test_hyphenated_share_class_resolves_to_the_right_permno():
+    hist = normalise_name_history(_history_with_class())
+    assert resolve_as_of(hist, "BRK-B", "2000-06-01") == [83443]
+    assert resolve_as_of(hist, "BRK-A", "2000-06-01") == [17778]
+    # the bare ticker still returns BOTH classes, since both are alive
+    assert resolve_as_of(hist, "BRK", "2000-06-01") == [17778, 83443]
+
+
+def test_plain_tickers_are_unaffected_by_share_class_handling():
+    hist = normalise_name_history(_history_with_class())
+    assert resolve_as_of(hist, "AAPL", "2015-06-01") == [14593]
+
+
+def test_missing_optional_columns_do_not_break_resolution():
+    """Older extracts have no shrcls/tsymbol; resolution must still work."""
+    frame = _history_with_class().drop(columns=["shrcls", "tsymbol"])
+    hist = normalise_name_history(frame)
+    assert resolve_as_of(hist, "AAPL", "2015-06-01") == [14593]
+    assert resolve_as_of(hist, "BRK-B", "2000-06-01") == []

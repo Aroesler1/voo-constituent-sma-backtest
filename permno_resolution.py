@@ -26,6 +26,8 @@ import pandas as pd
 COMMON_SHARE_CODES = (10, 11, 12, 18)
 
 NAME_HISTORY_COLUMNS = ("permno", "ticker", "namedt", "nameendt", "shrcd", "exchcd")
+# Optional columns used to resolve share-class tickers; absent in older extracts.
+OPTIONAL_COLUMNS = ("shrcls", "tsymbol")
 
 
 def normalise_name_history(frame: pd.DataFrame) -> pd.DataFrame:
@@ -33,7 +35,13 @@ def normalise_name_history(frame: pd.DataFrame) -> pd.DataFrame:
     missing = set(NAME_HISTORY_COLUMNS) - set(frame.columns)
     if missing:
         raise ValueError(f"name history missing columns: {sorted(missing)}")
-    out = frame.loc[:, list(NAME_HISTORY_COLUMNS)].copy()
+    keep = list(NAME_HISTORY_COLUMNS) + [c for c in OPTIONAL_COLUMNS if c in frame.columns]
+    out = frame.loc[:, keep].copy()
+    for col in OPTIONAL_COLUMNS:
+        if col in out.columns:
+            out[col] = out[col].astype(str).str.upper().str.strip().replace({"NAN": "", "NONE": ""})
+        else:
+            out[col] = ""
     out["ticker"] = out["ticker"].astype(str).str.upper().str.strip()
     out["permno"] = pd.to_numeric(out["permno"], errors="coerce").astype("Int64")
     for col in ("namedt", "nameendt"):
@@ -43,6 +51,23 @@ def normalise_name_history(frame: pd.DataFrame) -> pd.DataFrame:
     for col in ("shrcd", "exchcd"):
         out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
     return out.dropna(subset=["permno", "namedt"])
+
+
+def split_share_class(ticker: str) -> tuple[str, str]:
+    """Split a vendor ticker like BRK-B into its base symbol and share class.
+
+    CRSP does not put the share class in `ticker`; BRK-B does not appear there
+    at all, while BRK plus shrcls 'B' resolves to permno 83443. Data vendors and
+    index files commonly use the hyphenated form, so a universe built from them
+    silently loses every dual-class name unless the suffix is split off.
+    """
+    raw = str(ticker).upper().strip()
+    for sep in ("-", "."):
+        if sep in raw:
+            base, _, suffix = raw.partition(sep)
+            if base and suffix.isalpha() and len(suffix) <= 2:
+                return base, suffix
+    return raw, ""
 
 
 def resolve_as_of(
@@ -60,11 +85,16 @@ def resolve_as_of(
     """
     as_of = pd.Timestamp(as_of)
     frame = name_history
-    hits = frame[
-        (frame["ticker"] == str(ticker).upper().strip())
-        & (frame["namedt"] <= as_of)
-        & (frame["nameendt"] >= as_of)
-    ]
+    base, share_class = split_share_class(ticker)
+    alive = (frame["namedt"] <= as_of) & (frame["nameendt"] >= as_of)
+
+    hits = frame[alive & (frame["ticker"] == str(ticker).upper().strip())]
+    if hits.empty and "tsymbol" in frame.columns:
+        # some extracts carry the hyphenated form in tsymbol
+        hits = frame[alive & (frame["tsymbol"] == str(ticker).upper().strip())]
+    if hits.empty and share_class:
+        # BRK-B -> ticker BRK with shrcls B
+        hits = frame[alive & (frame["ticker"] == base) & (frame["shrcls"] == share_class)]
     if share_codes is not None:
         hits = hits[hits["shrcd"].isin(list(share_codes))]
     return sorted({int(p) for p in hits["permno"].dropna().tolist()})

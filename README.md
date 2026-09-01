@@ -47,7 +47,8 @@ This is the expected outcome for a 200-day SMA on index constituents, and it is 
 
 ### Caveats on these numbers
 
-- **Coverage gap.** 547 of 1,695 universe tickers did not resolve through CRSP and would previously have come from a vendor fallback whose key is no longer valid. The run continues on the 1,148 that did resolve, so the universe is incomplete and skewed toward names with clean CRSP ticker history.
+- **The sample effectively ends 2024-12-31, not 2026.** CRSP's coverage stops there while the configured end date runs later, so every current constituent is flagged as needing a "recent tail" it cannot get. An earlier draft of this section described that as a 32% coverage gap; it was not. 1,148 tickers resolved and 1,064 actually traded, with trades running 1996-10-15 to 2024-12-16. Only **51** tickers genuinely never appear in CRSP's name history, and most of those are delisted shells (`AAMRQ`, `ABKFQ`) rather than live constituents.
+- **Dual-class tickers needed a fix.** Vendor and index files write `BRK-B`; CRSP writes `BRK` with the class in a separate `shrcls` field, so the hyphenated form matches nothing and every dual-class name was silently lost. `permno_resolution.split_share_class` now splits the suffix and matches on ticker plus share class — `BRK-B` resolves to permno 83443, `BF-B` to 29946.
 - **The buy-and-hold column in the raw output is unreliable.** It reports a 2.86% CAGR, which is implausible for the period; the ETF benchmark has CRSP coverage only from late 2014 and the contaminated cache for it was quarantined. Compare against the S&P 500 total-return column instead.
 - Pre-2019 constituent history remains proxy-based rather than a licensed point-in-time master.
 
