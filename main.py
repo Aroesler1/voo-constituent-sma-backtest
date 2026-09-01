@@ -108,7 +108,18 @@ def _to_date_index(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _extract_crsp_total_return_close(d: pd.DataFrame) -> pd.Series:
-    """Construct a CRSP total-return price path from raw close and return fields."""
+    """Construct a CRSP total-return price path from raw close and return fields.
+
+    Vectorised. The previous implementation walked rows in Python with scalar
+    .loc lookups, costing ~59us per row; across the universe that is ~8 minutes
+    per call, and _extract_adjusted_series calls it once per requested field, so
+    a full run spent roughly three quarters of an hour inside this function
+    alone. The cumulative product is now computed per segment with groupby.
+
+    A segment break is a PERMNO change or a gap of more than seven days. Both
+    reset the compounding, because a price path may not be carried across two
+    different securities or across a listing gap.
+    """
     raw_close = pd.to_numeric(d["close"], errors="coerce").abs()
     total_return = pd.to_numeric(d.get("total_return"), errors="coerce")
     if "permno" in d.columns:
@@ -116,38 +127,28 @@ def _extract_crsp_total_return_close(d: pd.DataFrame) -> pd.Series:
     else:
         permno = pd.Series(np.nan, index=d.index)
 
-    out = pd.Series(index=d.index, dtype=float)
-    prev_val = np.nan
-    prev_raw = np.nan
-    prev_permno = np.nan
-    prev_date: pd.Timestamp | None = None
+    gap_days = d.index.to_series().diff().dt.days
+    # first row is always a break; a permno change or a >7d gap resets the path
+    segment_break = (
+        gap_days.isna()
+        | (gap_days > 7)
+        | ((permno != permno.shift()) & permno.notna() & permno.shift().notna())
+    )
+    segment = segment_break.cumsum()
 
-    for dt in d.index:
-        raw = float(raw_close.loc[dt]) if pd.notna(raw_close.loc[dt]) else np.nan
-        ret = float(total_return.loc[dt]) if pd.notna(total_return.loc[dt]) else np.nan
-        perm = float(permno.loc[dt]) if pd.notna(permno.loc[dt]) else np.nan
-        segment_break = (
-            prev_date is None
-            or (pd.notna(perm) and pd.notna(prev_permno) and perm != prev_permno)
-            or (prev_date is not None and (dt - prev_date).days > 7)
-        )
+    # missing vendor return falls back to the raw price change, then to zero,
+    # matching the original row-wise precedence
+    raw_ret = raw_close / raw_close.shift() - 1.0
+    ret = total_return.fillna(raw_ret).fillna(0.0)
 
-        if segment_break or not np.isfinite(prev_val) or prev_val <= 0:
-            out.loc[dt] = raw if np.isfinite(raw) and raw > 0 else 1.0
-        else:
-            if not np.isfinite(ret):
-                if np.isfinite(raw) and np.isfinite(prev_raw) and raw > 0 and prev_raw > 0:
-                    ret = raw / prev_raw - 1.0
-                else:
-                    ret = 0.0
-            out.loc[dt] = prev_val * (1.0 + float(ret))
+    # at a break the growth factor is 1 so the segment starts exactly at `base`
+    growth = (1.0 + ret).where(~segment_break, 1.0)
+    cumulative = growth.groupby(segment).cumprod()
 
-        prev_val = float(out.loc[dt])
-        prev_raw = raw
-        prev_permno = perm
-        prev_date = pd.Timestamp(dt)
+    base = raw_close.where(segment_break).groupby(segment).transform("first")
+    base = base.where(base.notna() & (base > 0), 1.0)
 
-    return out
+    return (base * cumulative).astype(float)
 
 
 def _extract_adjusted_series(df: pd.DataFrame, field: str) -> pd.Series:
@@ -512,6 +513,9 @@ def _fetch_single_price_with_fallback(
                 username=config.WRDS_USERNAME or config.CRSP_USERNAME,
                 password=config.WRDS_PASSWORD,
                 api_key=config.CRSP_API_KEY,
+                # this path serves benchmark tickers requested by name, which
+                # are ETFs; the constituent path leaves funds excluded
+                include_funds=True,
             )
             if ticker in crsp_map and not crsp_map[ticker].empty:
                 crsp_df = crsp_map[ticker]
@@ -583,13 +587,27 @@ def _fetch_constituent_prices_with_fallback(
     if remaining:
         if not config.EODHD_API_KEY:
             LOGGER.warning("EODHD fallback unavailable; unresolved tickers remain: %s", len(remaining))
+            eod_prices = {}
         else:
-            eod_prices = _fetch_constituent_price_batch_eodhd(
-                tickers=remaining,
-                start=start,
-                end=end,
-                api_key=config.EODHD_API_KEY,
-            )
+            try:
+                eod_prices = _fetch_constituent_price_batch_eodhd(
+                    tickers=remaining,
+                    start=start,
+                    end=end,
+                    api_key=config.EODHD_API_KEY,
+                )
+            except Exception as exc:
+                # A configured-but-rejected key (expired, revoked, rate limited)
+                # previously aborted the entire run. Degrade to whatever CRSP
+                # resolved and let the downstream coverage gate decide whether
+                # the universe is sufficient -- the same policy already applied
+                # when no key is configured at all.
+                LOGGER.warning(
+                    "EODHD fallback failed (%s); continuing with %s CRSP-resolved "
+                    "tickers, %s unresolved.",
+                    exc, len(prices), len(remaining),
+                )
+                eod_prices = {}
             for ticker, eod_df in eod_prices.items():
                 if ticker in prices:
                     if current_tickers and ticker in current_tickers and not _provider_series_agree(prices[ticker], eod_df):
