@@ -4,6 +4,23 @@ Institutional-style Python backtest for a constituent-level VOO trend-following 
 
 Repository: `https://github.com/Aroesler1/voo-constituent-sma-backtest`
 
+> ### Results are being regenerated after a data-integrity audit
+>
+> An audit of the cached CRSP universe found that **437 of 1,153 tickers (38%) resolve to more than one PERMNO**. CRSP tickers are reused across companies and collide across share classes, and this loader resolved ticker to PERMNO without a point-in-time constraint, so a single "ticker" series could splice unrelated securities together.
+>
+> Two distinct failure modes, both confirmed:
+>
+> - **Sequential reuse: 327 tickers (28.4%) whose segments are separated by more than a year.** `SOLV` has a **26.7-year gap** between its two securities. The cached `VOO` series splices PERMNO 86379 (1998-2010, an unrelated company that held the ticker) onto 12305 (the actual Vanguard ETF, from 2010). A 200-day SMA spanning such a boundary averages two different companies' prices, so the signal is corrupted, not merely one return.
+> - **Simultaneous share classes: 23 tickers with duplicate dates** (TAP, BIO, MKC, STZ, LEN, CBS, CNP). These raise inside `_extract_adjusted_series`; the exception is swallowed by a bare `except Exception` logged at DEBUG only, so the ticker is **silently dropped from the universe** - invisible selection bias in a repo whose premise is point-in-time discipline.
+>
+> **Every performance number below predates this audit and should not be relied on.** The fix is to resolve ticker to PERMNO as of each date via `crsp.dsenames` (`namedt`/`nameendt`), treat each PERMNO as a distinct instrument, and never concatenate across PERMNOs. Regeneration is blocked only on restoring WRDS access.
+>
+> Reproduce the audit yourself against any cache directory:
+>
+> ```bash
+> python audit_universe.py --cache-dir data_cache
+> ```
+
 The strategy evaluates the holdings underlying `VOO` on a point-in-time basis and holds only constituents trading above their `200-day SMA`, allocating capital equally across active names and routing the remainder to cash when breadth collapses.
 
 ## What This Project Does
