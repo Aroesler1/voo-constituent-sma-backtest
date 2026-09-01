@@ -44,7 +44,7 @@ from reporting import (
     print_summary_table,
     write_detailed_report,
 )
-from statistics_mt import deflated_sharpe, per_period_sharpe
+from statistics_mt import deflated_sharpe, per_period_sharpe, romano_wolf_stepdown
 from strategy import compute_sma_matrix, generate_active_mask
 
 LOGGER = logging.getLogger(__name__)
@@ -1302,6 +1302,40 @@ def main() -> None:
         gc.collect()
 
     sma_sweep_df = pd.DataFrame(sma_rows)
+
+    # Family-wise error control across the sweep. The Deflated Sharpe asks
+    # whether the SELECTED configuration beats the expected best of N noise
+    # strategies; Romano-Wolf asks which configurations have a mean excess
+    # return above zero while holding the probability of ANY false rejection
+    # across the whole family at 5%. The two answer different questions and
+    # both belong in a sweep report.
+    if len(sweep_excess_returns) >= 2:
+        try:
+            # The null is deliberately the BENCHMARK, not cash. Excess return
+            # over cash is a weak null that any long-equity strategy clears --
+            # testing against it found all five configurations "significant",
+            # which says only that stocks beat T-bills. The question worth
+            # asking is whether a configuration beats simply holding the index.
+            bench_ret = spy_close.pct_change(fill_method=None)
+            sweep_panel = pd.concat(
+                [
+                    (s + effective_cash_rate / 252.0)      # undo the cash excess
+                    .sub(bench_ret.reindex(s.index).fillna(0.0))
+                    .rename(f"sma_{int(n)}")
+                    for s, n in zip(sweep_excess_returns, config.SMA_SWEEP_VALUES)
+                ],
+                axis=1,
+            )
+            rw = romano_wolf_stepdown(sweep_panel, alpha=0.05, n_boot=1000)
+            n_sig = int(rw["significant"].sum())
+            LOGGER.info(
+                "Romano-Wolf stepdown vs benchmark (FWER 5%%): %s of %s "
+                "configurations significant",
+                n_sig, len(rw),
+            )
+            rw.to_csv(Path(config.OUTPUT_DIR) / "romano_wolf_sweep.csv", index=False)
+        except Exception as exc:
+            LOGGER.warning("Romano-Wolf stepdown skipped: %s", exc)
 
     # Deflated Sharpe (Bailey / Lopez de Prado) for every sweep configuration.
     # The multiple-testing pool counts every configuration this run evaluates:
