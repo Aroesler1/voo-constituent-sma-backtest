@@ -49,7 +49,7 @@ The Deflated Sharpe asks whether the selected configuration's Sharpe survives th
 
 `statistics_mt.probability_of_backtest_overfitting` implements combinatorially symmetric cross-validation: the daily return panel is cut into 16 contiguous blocks, all C(16,8) = 12,870 ways of using half for training and the complement for testing are enumerated, and PBO is the share of those splits in which the in-sample winner ranked in the bottom half out of sample. CSCV is used rather than a single train/test cut because one cut point is arbitrary, and because the symmetric design means every block trains exactly as often as it tests.
 
-It is computed over the **five SMA lengths that already exist** (150/175/200/225/250), on 7,300 daily observations from 1996-01-02 to 2024-12-31. Widening the sweep would make PBO look more interesting without making it more informative.
+It is computed over the **five SMA lengths that already exist** (150/175/200/225/250), on the 7,300-day panel from 1996-01-02 to 2024-12-31 (7,296 observations enter the statistic: the four trailing days that cannot fill a 16th equal block are dropped rather than folded into the last one, which would break the symmetry CSCV is named for). Widening the sweep would make PBO look more interesting without making it more informative.
 
 | statistic | value |
 |---|---|
