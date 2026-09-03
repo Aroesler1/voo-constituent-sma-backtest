@@ -7,7 +7,7 @@ Repository: `https://github.com/Aroesler1/voo-constituent-sma-backtest`
 ## What it does
 
 - **Point-in-time universe construction** from CRSP, with S&P membership history and delisting returns compounded into the final return of names that exit
-- **Retail-implementable cost model**: EDGE effective spreads (Ardia, Guidotti & Kroencke, JFE 2024), opening-auction slippage, participation-based impact, and FINRA regulatory fees
+- **Retail-implementable cost model**: EDGE effective spreads (Ardia, Guidotti & Kroencke, JFE 2024), opening-auction slippage, participation-based impact, and FINRA regulatory fees. Making costs the centrepiece rather than an afterthought is supported by ["Implementation Risk in Portfolio Backtesting"](https://arxiv.org/abs/2603.20319) (Yin, Miki, Lesnichenko & Gural, 2026), which ran 15 strategies across five open-source backtesting engines and found the engines agree exactly at zero cost — "isolating transaction-cost implementation as the sole source of disagreement" — with divergence reaching 3.71% for high-turnover strategies, which at 4.5x annual turnover is the regime this strategy sits in
 - **Multiple-testing-aware validation**: Deflated Sharpe Ratio over the SMA-length sweep, with the full configuration grid as the trial pool
 - **A universe integrity audit** (`audit_universe.py`) that checks the CRSP ticker→PERMNO mapping is point-in-time correct, and a resolver (`permno_resolution.py`) that fixes it
 
@@ -43,7 +43,25 @@ Choosing the weak null would have produced five significant results and a much b
 
 The Deflated Sharpe over the 9-configuration sweep is 0.985, meaning the *selected configuration* is unlikely to be the best of nine noise strategies. That is worth stating precisely: it says the configuration search did not manufacture the result. It does not say the result is good, and here it is not.
 
+### Probability of Backtest Overfitting
+
+The Deflated Sharpe asks whether the selected configuration's Sharpe survives the fact that several were tried. The **Probability of Backtest Overfitting** asks a sharper question about the selection procedure itself: pick the best configuration in sample, and how often does it land in the bottom half out of sample? Bailey, Borwein, López de Prado and Zhu, ["The Probability of Backtest Overfitting"](https://doi.org/10.2139/ssrn.2326253) (*Journal of Computational Finance* 20(4), 2017).
+
+`statistics_mt.probability_of_backtest_overfitting` implements combinatorially symmetric cross-validation: the daily return panel is cut into 16 contiguous blocks, all C(16,8) = 12,870 ways of using half for training and the complement for testing are enumerated, and PBO is the share of those splits in which the in-sample winner ranked in the bottom half out of sample. CSCV is used rather than a single train/test cut because one cut point is arbitrary, and because the symmetric design means every block trains exactly as often as it tests.
+
+Two things about reading the number honestly. It is computed over the **five SMA lengths that already exist** (150/175/200/225/250) — widening the sweep would make PBO look more interesting without making it more informative. And with five configurations the out-of-sample rank takes only five values, so the logit is quantised and PBO is coarse: it is an indicator, not a precise probability.
+
+Reproduce, from the per-configuration daily returns `main.py` writes:
+
+```bash
+python run_pbo.py
+```
+
 This is the expected outcome for a 200-day SMA on index constituents, and it is reported rather than buried. The contribution of this repository is the infrastructure and the audit, not the strategy.
+
+### What the literature says
+
+This result is not news, and presenting it as this repository's finding would overstate it. Zakamulin has made the same case twice on far longer samples: ["The Real-Life Performance of Market Timing with Moving Average and Time-Series Momentum Rules"](https://doi.org/10.2139/ssrn.2242795) (*Journal of Asset Management* 15, 2014) argues that the published performance of moving-average timing rules contains considerable data-mining bias and ignores market frictions, and that the advantage largely disappears in out-of-sample tests carrying realistic transaction costs; ["A Comprehensive Look at the Empirical Performance of Moving Average Trading Strategies"](https://doi.org/10.2139/ssrn.2677212) (2015) reaches the same conclusion over **155 years** of data, finding no single optimal lookback and no reliable out-of-sample edge. What is contributed here is not the conclusion but the audit trail behind it: a point-in-time CRSP universe with the ticker-to-PERMNO collisions actually resolved, a cost model built from a published spread estimator rather than a flat assumption, and the multiple-testing statistics reported below.
 
 ### Caveats on these numbers
 
@@ -109,6 +127,8 @@ backtest_engine.py   Constituent-level portfolio simulation
 metrics.py           Performance and risk analytics
 reporting.py         Tables, charts, and markdown report generation
 main.py              End-to-end pipeline entrypoint
+statistics_mt.py     Deflated Sharpe, Romano-Wolf stepdown, PBO via CSCV
+run_pbo.py           Probability of Backtest Overfitting for the SMA sweep
 data/universe/       Source universe proxy datasets
 requirements.txt     Python dependencies
 ```
@@ -141,6 +161,7 @@ Default reporting schedule is `semi_monthly`, with full comparisons against `dai
 ## Statistical Honesty
 
 - The SMA-length sweep and schedule comparison constitute a multiple-testing search, so the report includes the Deflated Sharpe Ratio (Bailey and Lopez de Prado 2014) for the selected configuration and for every sweep entry, with the full sweep treated as the trial pool. A high raw Sharpe with a low deflated Sharpe means the configuration choice is not statistically distinguishable from picking the best of several noise strategies.
+- The Probability of Backtest Overfitting (CSCV; Bailey, Borwein, López de Prado & Zhu 2017) is reported alongside the Deflated Sharpe over the same five-length sweep. The two answer different questions: DSR asks whether the selected Sharpe survives the search, PBO asks whether the in-sample ranking predicts the out-of-sample ranking at all.
 - Trade-level profit concentration (`profit_top5pct_share`, `profit_top10pct_share`) is reported because single-stock trend following concentrates most profit in a small tail of trades; averages alone hide this dependence.
 - CRSP delisting returns (`dsedelist.dlret`) are compounded into the final return of names that exit, so departures do not silently leave at their last quoted price.
 
@@ -200,6 +221,8 @@ Successful runs write artifacts to `output/`, including:
 - `schedule_risk_return.png`
 - `sma_sweep.png`
 - `regime_comparison.png`
+- `sma_sweep_returns.csv` (per-configuration daily returns; the input `run_pbo.py` needs)
+- `pbo_sweep.csv`
 - `run_manifest.json`
 
 ## Intended Use

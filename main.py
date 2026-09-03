@@ -43,7 +43,12 @@ from reporting import (
     print_summary_table,
     write_detailed_report,
 )
-from statistics_mt import deflated_sharpe, per_period_sharpe, romano_wolf_stepdown
+from statistics_mt import (
+    deflated_sharpe,
+    per_period_sharpe,
+    probability_of_backtest_overfitting,
+    romano_wolf_stepdown,
+)
 from strategy import compute_sma_matrix, generate_active_mask
 
 LOGGER = logging.getLogger(__name__)
@@ -1196,6 +1201,41 @@ def main() -> None:
             rw.to_csv(Path(config.OUTPUT_DIR) / "romano_wolf_sweep.csv", index=False)
         except Exception as exc:
             LOGGER.warning("Romano-Wolf stepdown skipped: %s", exc)
+
+        # Persist the per-configuration daily return panel. It is the input the
+        # Probability of Backtest Overfitting needs, and without it PBO cannot
+        # be recomputed without rerunning the whole backtest.
+        try:
+            sweep_returns = pd.concat(
+                [
+                    (s + effective_cash_rate / 252.0).rename(f"sma_{int(n)}")
+                    for s, n in zip(sweep_excess_returns, config.SMA_SWEEP_VALUES)
+                ],
+                axis=1,
+            )
+            sweep_returns.to_csv(Path(config.OUTPUT_DIR) / "sma_sweep_returns.csv")
+
+            # PBO asks whether picking the best configuration IN SAMPLE tells
+            # you anything about its OUT-OF-SAMPLE rank. The Deflated Sharpe
+            # asks whether the selected Sharpe survives the search; these are
+            # different questions and the report carries both.
+            pbo = probability_of_backtest_overfitting(sweep_returns, n_splits=16)
+            LOGGER.info(
+                "PBO (CSCV, %s blocks, %s splits): %.3f; median OOS rank of the "
+                "in-sample winner %.1f of %s",
+                pbo["n_splits"], pbo["n_combinations"], pbo["pbo"],
+                pbo["median_oos_rank"], pbo["n_configs"],
+            )
+            pd.DataFrame({
+                "pbo": [pbo["pbo"]],
+                "n_combinations": [pbo["n_combinations"]],
+                "n_configs": [pbo["n_configs"]],
+                "n_splits": [pbo["n_splits"]],
+                "obs_used": [pbo["obs_used"]],
+                "median_oos_rank": [pbo["median_oos_rank"]],
+            }).to_csv(Path(config.OUTPUT_DIR) / "pbo_sweep.csv", index=False)
+        except Exception as exc:
+            LOGGER.warning("PBO skipped: %s", exc)
 
     # Deflated Sharpe (Bailey / Lopez de Prado) for every sweep configuration.
     # The multiple-testing pool counts every configuration this run evaluates:
