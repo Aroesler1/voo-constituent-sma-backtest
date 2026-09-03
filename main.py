@@ -19,7 +19,6 @@ from config import BacktestConfig, config_hash, get_periods, load_config
 from data_loader import (
     build_snapshot_manifest_row,
     fetch_crsp_batch_prices,
-    fetch_eodhd,
     fetch_fred_cash_rate,
     fetch_sec_voo_holdings_proxy,
     fetch_sp500_membership_history_public,
@@ -152,7 +151,7 @@ def _extract_crsp_total_return_close(d: pd.DataFrame) -> pd.Series:
 
 
 def _extract_adjusted_series(df: pd.DataFrame, field: str) -> pd.Series:
-    """Extract adjusted OHLCV series from EODHD-like frames."""
+    """Extract adjusted OHLCV series from normalized vendor OHLCV frames."""
     d = _to_date_index(df)
     is_crsp = "total_return" in d.columns and "permno" in d.columns
 
@@ -378,52 +377,6 @@ def _sanitize_open_matrix(
     return out
 
 
-def _provider_series_agree(primary_df: pd.DataFrame, fallback_df: pd.DataFrame) -> bool:
-    """Check whether two vendor series materially agree on recent overlap."""
-    try:
-        primary = _extract_adjusted_series(primary_df, "close").dropna()
-        fallback = _extract_adjusted_series(fallback_df, "close").dropna()
-    except Exception:
-        return True
-
-    overlap = pd.concat([primary.rename("primary"), fallback.rename("fallback")], axis=1, join="inner").dropna()
-    if len(overlap) < 60:
-        return True
-
-    ratio_full = (overlap["primary"] / overlap["fallback"]).replace([np.inf, -np.inf], np.nan).dropna()
-    ret_full = overlap.pct_change(fill_method=None).dropna()
-    overlap_recent = overlap.tail(252)
-    ratio_recent = (overlap_recent["primary"] / overlap_recent["fallback"]).replace([np.inf, -np.inf], np.nan).dropna()
-    ret_recent = overlap_recent.pct_change(fill_method=None).dropna()
-
-    if ratio_full.empty or ret_recent.empty:
-        return True
-
-    median_ratio_recent = float(ratio_recent.median()) if len(ratio_recent) else np.nan
-    corr_recent = float(ret_recent["primary"].corr(ret_recent["fallback"])) if len(ret_recent) > 1 else np.nan
-    median_abs_diff_recent_bps = float((ret_recent["primary"] - ret_recent["fallback"]).abs().median() * 10000.0)
-
-    ratio_outlier_share = float(((ratio_full < 0.5) | (ratio_full > 2.0)).mean()) if len(ratio_full) else 0.0
-    ratio_q10 = float(ratio_full.quantile(0.10)) if len(ratio_full) else np.nan
-    ratio_q90 = float(ratio_full.quantile(0.90)) if len(ratio_full) else np.nan
-    ratio_dispersion = (ratio_q90 / ratio_q10) if pd.notna(ratio_q10) and ratio_q10 > 0 else np.inf
-    corr_full = float(ret_full["primary"].corr(ret_full["fallback"])) if len(ret_full) > 1 else np.nan
-    median_abs_diff_full_bps = float((ret_full["primary"] - ret_full["fallback"]).abs().median() * 10000.0) if len(ret_full) else np.nan
-
-    recent_ok = 0.80 <= median_ratio_recent <= 1.25 and (
-        (pd.notna(corr_recent) and corr_recent >= 0.98) or median_abs_diff_recent_bps <= 25.0
-    )
-    full_ok = (
-        ratio_outlier_share <= 0.02
-        and ratio_dispersion <= 1.5
-        and (
-            (pd.notna(corr_full) and corr_full >= 0.95)
-            or median_abs_diff_full_bps <= 40.0
-        )
-    )
-    return recent_ok and full_ok
-
-
 def _max_available_date(df: pd.DataFrame) -> pd.Timestamp | None:
     """Return the max date in a normalized price frame."""
     if df.empty or "date" not in df.columns:
@@ -439,190 +392,97 @@ def _needs_recent_tail(df: pd.DataFrame, requested_end: str, tolerance_days: int
     return max_date < (pd.Timestamp(requested_end) - pd.Timedelta(days=tolerance_days))
 
 
-def _merge_price_frames(primary_df: pd.DataFrame, fallback_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge two normalized price frames, preferring primary rows on overlap."""
-    primary = primary_df.copy()
-    fallback = fallback_df.copy()
-    primary["date"] = pd.to_datetime(primary["date"])
-    fallback["date"] = pd.to_datetime(fallback["date"])
-
-    merged = pd.concat([primary, fallback], axis=0, ignore_index=True, sort=False)
-    merged = merged.sort_values(["date"]).drop_duplicates(subset=["date"], keep="first").reset_index(drop=True)
-    merged.attrs["snapshot_id"] = f"{primary_df.attrs.get('snapshot_id')}|{fallback_df.attrs.get('snapshot_id')}"
-    merged.attrs["fetched_at_utc"] = max(
-        str(primary_df.attrs.get("fetched_at_utc", "")),
-        str(fallback_df.attrs.get("fetched_at_utc", "")),
-    )
-    merged.attrs["sha256"] = f"{primary_df.attrs.get('sha256')}|{fallback_df.attrs.get('sha256')}"
-    return merged
-
-
-def _fetch_constituent_price_batch_eodhd(
-    tickers: list[str],
-    start: str,
-    end: str,
-    api_key: str,
-) -> dict[str, pd.DataFrame]:
-    """Fetch constituent prices from EODHD with progress logging and skip-on-failure."""
-    requested = sorted({_normalize_ticker(t) for t in tickers if str(t).strip()})
-    prices: dict[str, pd.DataFrame] = {}
-    failed = 0
-
-    for i, ticker in enumerate(requested, start=1):
-        try:
-            df = fetch_eodhd(ticker=ticker, start=start, end=end, api_key=api_key)
-            prices[ticker] = df
-        except Exception as exc:
-            failed += 1
-            LOGGER.warning("Skipping %s after EODHD fetch failure: %s", ticker, exc)
-
-        if i % 100 == 0 or i == len(requested):
-            LOGGER.info(
-                "Constituent fetch progress: %s/%s completed (success=%s, failed=%s).",
-                i,
-                len(requested),
-                len(prices),
-                failed,
-            )
-
-    if not prices:
-        raise RuntimeError("No constituent price histories were fetched.")
-
-    return prices
-
-
-def _fetch_single_price_with_fallback(
+def _fetch_benchmark_series(
     ticker: str,
     start: str,
     end: str,
     config: BacktestConfig,
 ) -> tuple[pd.DataFrame, str]:
-    """Fetch one benchmark series using CRSP first when configured, then EODHD.
+    """Fetch one benchmark series from CRSP.
 
-    Benchmark ETFs used to short-circuit straight to EODHD, which contradicted
-    this docstring and made the whole run fail hard whenever the EODHD key was
-    absent or rejected -- even with a complete CRSP series already cached. They
-    now follow the same CRSP-first, EODHD-fallback path as any other ticker.
+    Benchmark tickers are ETFs, so this path passes include_funds=True; the
+    constituent path leaves funds excluded. There is no vendor fallback: CRSP is
+    the only price source, and a missing benchmark is a hard failure rather than
+    something to paper over with a second-best series.
     """
-    if config.PRIMARY_PRICE_SOURCE == "crsp" and config.has_crsp_credentials():
-        try:
-            crsp_map = fetch_crsp_batch_prices(
-                tickers=[ticker],
-                start=start,
-                end=end,
-                username=config.WRDS_USERNAME or config.CRSP_USERNAME,
-                password=config.WRDS_PASSWORD,
-                api_key=config.CRSP_API_KEY,
-                # this path serves benchmark tickers requested by name, which
-                # are ETFs; the constituent path leaves funds excluded
-                include_funds=True,
-            )
-            if ticker in crsp_map and not crsp_map[ticker].empty:
-                crsp_df = crsp_map[ticker]
-                if not _needs_recent_tail(crsp_df, end) or not config.EODHD_API_KEY:
-                    return crsp_df, "crsp"
-                LOGGER.warning(
-                    "CRSP coverage for %s ends at %s; extending with EODHD.",
-                    ticker,
-                    _max_available_date(crsp_df).date().isoformat(),
-                )
-                try:
-                    eod_df = fetch_eodhd(ticker, start, end, config.EODHD_API_KEY)
-                except Exception as exc:
-                    # an expired or rate-limited vendor key must not discard an
-                    # otherwise complete CRSP history; serve what we have and
-                    # let the coverage gate decide whether the tail is required
-                    LOGGER.warning(
-                        "EODHD tail extension failed for %s (%s); using CRSP only.",
-                        ticker,
-                        exc,
-                    )
-                    return crsp_df, "crsp"
-                return _merge_price_frames(crsp_df, eod_df), "crsp+eodhd"
-        except Exception as exc:
-            LOGGER.warning("CRSP benchmark fetch failed for %s: %s", ticker, exc)
-
-    if not config.EODHD_API_KEY:
-        raise ValueError(f"No fallback provider available for {ticker}; missing EODHD_API_KEY.")
-    return fetch_eodhd(ticker, start, end, config.EODHD_API_KEY), "eodhd"
+    if config.PRIMARY_PRICE_SOURCE != "crsp" or not config.has_crsp_credentials():
+        raise ValueError(
+            f"Cannot fetch benchmark {ticker}: CRSP is the only price source and "
+            "its credentials are not configured."
+        )
+    crsp_map = fetch_crsp_batch_prices(
+        tickers=[ticker],
+        start=start,
+        end=end,
+        username=config.WRDS_USERNAME or config.CRSP_USERNAME,
+        password=config.WRDS_PASSWORD,
+        api_key=config.CRSP_API_KEY,
+        include_funds=True,
+    )
+    df = crsp_map.get(ticker)
+    if df is None or df.empty:
+        raise ValueError(f"CRSP returned no rows for benchmark {ticker}.")
+    if _needs_recent_tail(df, end):
+        LOGGER.warning(
+            "CRSP coverage for %s ends at %s, before the requested end %s; "
+            "the effective sample is shorter than configured.",
+            ticker,
+            _max_available_date(df).date().isoformat(),
+            end,
+        )
+    return df, "crsp"
 
 
-def _fetch_constituent_prices_with_fallback(
+def _fetch_constituent_prices(
     tickers: list[str],
     start: str,
     end: str,
     config: BacktestConfig,
     current_tickers: set[str] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
-    """Fetch constituent prices using CRSP first when available, then EODHD fallback."""
+    """Fetch constituent prices from CRSP.
+
+    CRSP is the only price source. Tickers it cannot resolve are reported and
+    left out rather than backfilled from a second vendor, so the universe stays
+    a single consistent PERMNO-keyed panel and the coverage gate downstream sees
+    the true shortfall.
+    """
     requested = sorted({_normalize_ticker(t) for t in tickers if str(t).strip()})
-    prices: dict[str, pd.DataFrame] = {}
-    source_map: dict[str, str] = {}
+    if config.PRIMARY_PRICE_SOURCE != "crsp" or not config.has_crsp_credentials():
+        raise ValueError("CRSP is the only price source and its credentials are not configured.")
 
-    if config.PRIMARY_PRICE_SOURCE == "crsp" and config.has_crsp_credentials():
-        try:
-            crsp_prices = fetch_crsp_batch_prices(
-                tickers=requested,
-                start=start,
-                end=end,
-                username=config.WRDS_USERNAME or config.CRSP_USERNAME,
-                password=config.WRDS_PASSWORD,
-                api_key=config.CRSP_API_KEY,
-            )
-            prices.update(crsp_prices)
-            source_map.update({ticker: "crsp" for ticker in crsp_prices})
-            LOGGER.info("Primary CRSP fetch resolved %s/%s tickers.", len(crsp_prices), len(requested))
-        except Exception as exc:
-            LOGGER.warning("CRSP batch fetch failed; falling back to EODHD for all missing tickers: %s", exc)
+    crsp_prices = fetch_crsp_batch_prices(
+        tickers=requested,
+        start=start,
+        end=end,
+        username=config.WRDS_USERNAME or config.CRSP_USERNAME,
+        password=config.WRDS_PASSWORD,
+        api_key=config.CRSP_API_KEY,
+    )
+    prices = dict(crsp_prices)
+    source_map = {ticker: "crsp" for ticker in crsp_prices}
+    LOGGER.info("CRSP resolved %s/%s tickers.", len(prices), len(requested))
 
-    remaining = [ticker for ticker in requested if ticker not in prices]
-    stale_current = [
-        ticker
-        for ticker, df in prices.items()
+    unresolved = [ticker for ticker in requested if ticker not in prices]
+    if unresolved:
+        LOGGER.warning(
+            "%s tickers did not resolve through CRSP and are excluded: %s",
+            len(unresolved),
+            ", ".join(unresolved[:20]) + ("..." if len(unresolved) > 20 else ""),
+        )
+    # CRSP coverage ends before the configured END_DATE, so current constituents
+    # look stale. This used to trigger a vendor tail extension; it is now
+    # reported, because the honest statement is that the sample ends early.
+    stale = [
+        ticker for ticker, df in prices.items()
         if current_tickers and ticker in current_tickers and _needs_recent_tail(df, end)
     ]
-    if stale_current:
-        LOGGER.warning("CRSP stale current constituents requiring EODHD tail extension: %s", len(stale_current))
-        remaining = sorted(set(remaining) | set(stale_current))
-    if remaining:
-        if not config.EODHD_API_KEY:
-            LOGGER.warning("EODHD fallback unavailable; unresolved tickers remain: %s", len(remaining))
-            eod_prices = {}
-        else:
-            try:
-                eod_prices = _fetch_constituent_price_batch_eodhd(
-                    tickers=remaining,
-                    start=start,
-                    end=end,
-                    api_key=config.EODHD_API_KEY,
-                )
-            except Exception as exc:
-                # A configured-but-rejected key (expired, revoked, rate limited)
-                # previously aborted the entire run. Degrade to whatever CRSP
-                # resolved and let the downstream coverage gate decide whether
-                # the universe is sufficient -- the same policy already applied
-                # when no key is configured at all.
-                LOGGER.warning(
-                    "EODHD fallback failed (%s); continuing with %s CRSP-resolved "
-                    "tickers, %s unresolved.",
-                    exc, len(prices), len(remaining),
-                )
-                eod_prices = {}
-            for ticker, eod_df in eod_prices.items():
-                if ticker in prices:
-                    if current_tickers and ticker in current_tickers and not _provider_series_agree(prices[ticker], eod_df):
-                        LOGGER.warning(
-                            "Provider validation failed for %s; replacing CRSP history with EODHD for ticker consistency.",
-                            ticker,
-                        )
-                        prices[ticker] = eod_df
-                        source_map[ticker] = "eodhd_validated"
-                    else:
-                        prices[ticker] = _merge_price_frames(prices[ticker], eod_df)
-                        source_map[ticker] = "crsp+eodhd"
-                else:
-                    prices[ticker] = eod_df
-                    source_map[ticker] = "eodhd"
+    if stale:
+        LOGGER.warning(
+            "%s current constituents have CRSP history ending before %s; "
+            "the effective sample end is earlier than configured.",
+            len(stale), end,
+        )
 
     return prices, source_map
 
@@ -971,16 +831,16 @@ def main() -> None:
     Path(config.CACHE_DIR).mkdir(parents=True, exist_ok=True)
 
     LOGGER.info("Starting institutional constituent-level VOO SMA backtest.")
-    if not config.has_crsp_credentials() and not config.EODHD_API_KEY:
-        raise ValueError("Missing both CRSP/WRDS credentials and EODHD_API_KEY.")
+    if not config.has_crsp_credentials():
+        raise ValueError("Missing CRSP/WRDS credentials; CRSP is the only price source.")
 
     # 1) Universe proxy sources (point-in-time snapshots)
     sp500_events = fetch_sp500_membership_history_public(config.START_DATE, config.END_DATE)
     sec_holdings = fetch_sec_voo_holdings_proxy(config.PRE2019_PROXY_CUTOFF, config.END_DATE)
 
     # 2) Benchmarks + trading calendar anchor
-    voo_daily, voo_source = _fetch_single_price_with_fallback("VOO", config.START_DATE, config.END_DATE, config)
-    spy_daily, spy_source = _fetch_single_price_with_fallback("SPY", config.START_DATE, config.END_DATE, config)
+    voo_daily, voo_source = _fetch_benchmark_series("VOO", config.START_DATE, config.END_DATE, config)
+    spy_daily, spy_source = _fetch_benchmark_series("SPY", config.START_DATE, config.END_DATE, config)
 
     voo_close = _extract_adjusted_series(voo_daily, "close").sort_index()
     spy_close = _extract_adjusted_series(spy_daily, "close").sort_index()
@@ -1014,7 +874,7 @@ def main() -> None:
     LOGGER.info("Universe symbols identified: %s", len(universe_tickers))
 
     # 4) Fetch constituent prices
-    constituent_prices, constituent_source_map = _fetch_constituent_prices_with_fallback(
+    constituent_prices, constituent_source_map = _fetch_constituent_prices(
         tickers=universe_tickers,
         start=config.START_DATE,
         end=config.END_DATE,
@@ -1484,7 +1344,7 @@ def main() -> None:
         "config": {
             k: v
             for k, v in vars(config).items()
-            if k not in {"EODHD_API_KEY", "FRED_API_KEY"}
+            if k not in {"FRED_API_KEY"}
         },
         "package_versions": _package_versions(),
         "snapshots": snapshot_rows,

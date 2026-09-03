@@ -519,45 +519,6 @@ def _fetch_or_load_with_snapshot(
     return _finalize_and_log(normalized, vendor=vendor, ticker=ticker, source_label="live_fetch")
 
 
-def fetch_eodhd(ticker: str, start: str, end: str, api_key: str) -> pd.DataFrame:
-    """Fetch daily OHLCV data from EODHD."""
-    if not api_key:
-        raise ValueError("EODHD API key is missing.")
-
-    endpoint = f"https://eodhd.com/api/eod/{ticker.upper()}.US"
-
-    def _live_fetch() -> Any:
-        return _request_json_with_retries(
-            endpoint,
-            params={"from": start, "to": end, "fmt": "json", "api_token": api_key},
-        )
-
-    def _normalize(raw_payload: Any) -> pd.DataFrame:
-        if not isinstance(raw_payload, list) or len(raw_payload) == 0:
-            raise ValueError("Malformed/empty EODHD response.")
-        df = pd.DataFrame(raw_payload)
-        expected_cols = ["date", "open", "high", "low", "close", "adjusted_close", "volume"]
-        missing = [c for c in expected_cols if c not in df.columns]
-        if missing:
-            raise ValueError(f"EODHD response missing columns: {missing}")
-        df = df[expected_cols].copy()
-        df["source_vendor"] = "eodhd"
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        for col in ["open", "high", "low", "close", "adjusted_close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=expected_cols)
-        return df
-
-    return _fetch_or_load_with_snapshot(
-        vendor="eodhd",
-        ticker=ticker,
-        start=start,
-        end=end,
-        live_fetch_fn=_live_fetch,
-        normalize_fn=_normalize,
-    )
-
-
 def _get_wrds_connection(
     *,
     username: str | None,

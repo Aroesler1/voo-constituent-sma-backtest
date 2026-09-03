@@ -48,6 +48,11 @@ This is the expected outcome for a 200-day SMA on index constituents, and it is 
 ### Caveats on these numbers
 
 - **The sample effectively ends 2024-12-31, not 2026.** CRSP's coverage stops there while the configured end date runs later, so every current constituent is flagged as needing a "recent tail" it cannot get. An earlier draft of this section described that as a 32% coverage gap; it was not. 1,148 tickers resolved and 1,064 actually traded, with trades running 1996-10-15 to 2024-12-16. Only **51** tickers genuinely never appear in CRSP's name history, and most of those are delisted shells (`AAMRQ`, `ABKFQ`) rather than live constituents.
+- **EODHD was removed entirely (2026-09).** The loader previously fell back to a
+  second vendor for tickers CRSP could not resolve, and spliced a vendor tail onto
+  CRSP history for current constituents. Both are gone: unresolved tickers are now
+  reported and excluded, so the universe is a single consistent PERMNO-keyed panel
+  and the coverage gate sees the true shortfall rather than a patched-over one.
 - **Dual-class tickers needed a fix.** Vendor and index files write `BRK-B`; CRSP writes `BRK` with the class in a separate `shrcls` field, so the hyphenated form matches nothing and every dual-class name was silently lost. `permno_resolution.split_share_class` now splits the suffix and matches on ticker plus share class — `BRK-B` resolves to permno 83443, `BF-B` to 29946.
 - **The buy-and-hold column in the raw output is unreliable.** It reports a 2.86% CAGR, which is implausible for the period; the ETF benchmark has CRSP coverage only from late 2014 and the contaminated cache for it was quarantined. Compare against the S&P 500 total-return column instead.
 - Pre-2019 constituent history remains proxy-based rather than a licensed point-in-time master.
@@ -77,7 +82,7 @@ The strategy evaluates the holdings underlying `VOO` on a point-in-time basis an
 - Builds a point-in-time constituent universe using:
   - SEC-based `VOO` holdings proxy post-2019
   - public S&P 500 membership history proxy pre-2019
-- Fetches price history with `CRSP/WRDS` as primary and `EODHD` as validated fallback
+- Fetches price history from `CRSP/WRDS`, the single price source
 - Simulates daily, weekly, semi-monthly, and monthly rebalance schedules
 - Applies realistic implementation assumptions:
   - next-session open execution
@@ -124,7 +129,7 @@ Default reporting schedule is `semi_monthly`, with full comparisons against `dai
 
 - Point-in-time constituent membership
 - Snapshot-backed vendor inputs
-- CRSP-first price sourcing with cross-vendor validation
+- CRSP price sourcing, PERMNO-keyed and point-in-time
 - Time-varying cash sleeve using `DGS3MO`
 - Retail-implementable cost model:
   - opening-auction slippage
@@ -164,7 +169,6 @@ cp .env.example .env
 Supported credentials:
 
 - `WRDS_USERNAME` / `WRDS_PASSWORD` for CRSP access
-- `EODHD_API_KEY` for fallback price coverage
 - `FRED_API_KEY` for cash-rate retrieval
 
 ## Running The Backtest

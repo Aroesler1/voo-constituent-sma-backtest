@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -164,60 +163,6 @@ def splice_spy_voo(
     out = combined[["open", "high", "low", "close", "volume"]].copy()
     out["total_return_index"] = tri
     out = out.reset_index().rename(columns={"index": "date", "date": "date"})
-    return out
-
-
-def cross_validate_vendors(
-    eodhd_weekly: pd.DataFrame,
-    secondary_weekly: pd.DataFrame,
-    threshold_bps: float,
-) -> pd.DataFrame:
-    """Cross-validate weekly return consistency across vendors."""
-    eod = eodhd_weekly.copy()
-    secondary = secondary_weekly.copy()
-
-    if "date" not in eod.columns:
-        eod = eod.reset_index().rename(columns={eod.index.name or "index": "date"})
-    if "date" not in secondary.columns:
-        secondary = secondary.reset_index().rename(columns={secondary.index.name or "index": "date"})
-
-    eod["date"] = pd.to_datetime(eod["date"])
-    secondary["date"] = pd.to_datetime(secondary["date"])
-
-    eod_ret = eod[["date", "close"]].sort_values("date")
-    eod_ret["eodhd_return"] = eod_ret["close"].pct_change()
-
-    secondary_ret = secondary[["date", "close"]].sort_values("date")
-    secondary_ret["secondary_return"] = secondary_ret["close"].pct_change()
-
-    out = pd.merge(
-        eod_ret[["date", "eodhd_return"]],
-        secondary_ret[["date", "secondary_return"]],
-        on="date",
-        how="inner",
-    ).dropna(subset=["eodhd_return", "secondary_return"])
-
-    out["abs_diff_bps"] = (out["eodhd_return"] - out["secondary_return"]).abs() * 10000.0
-    out["flagged"] = out["abs_diff_bps"] > threshold_bps
-
-    flagged_count = int(out["flagged"].sum())
-    total = len(out)
-    LOGGER.info(
-        "Vendor cross-validation: flagged=%s/%s, max=%.3f bps, mean=%.3f bps, median=%.3f bps",
-        flagged_count,
-        total,
-        out["abs_diff_bps"].max() if total else np.nan,
-        out["abs_diff_bps"].mean() if total else np.nan,
-        out["abs_diff_bps"].median() if total else np.nan,
-    )
-
-    if total > 0 and flagged_count / total > 0.02:
-        warnings.warn(
-            f"Vendor discrepancies exceed 2% of weeks ({flagged_count / total:.2%}).",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
     return out
 
 

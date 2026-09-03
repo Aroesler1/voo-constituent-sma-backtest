@@ -122,7 +122,6 @@ class BacktestConfig:
     CRSP_USERNAME: str | None = None
     WRDS_USERNAME: str | None = None
     WRDS_PASSWORD: str | None = None
-    EODHD_API_KEY: str | None = None
     FRED_API_KEY: str | None = None
     CRSP_BATCH_SIZE: int = 200
 
@@ -137,8 +136,8 @@ class BacktestConfig:
 
     def validate(self) -> None:
         """Validate internal consistency of configuration."""
-        if self.PRIMARY_PRICE_SOURCE not in {"crsp", "eodhd"}:
-            raise ValueError("PRIMARY_PRICE_SOURCE must be 'crsp' or 'eodhd'.")
+        if self.PRIMARY_PRICE_SOURCE != "crsp":
+            raise ValueError("PRIMARY_PRICE_SOURCE must be 'crsp'; it is the only price source.")
         if self.STRATEGY_MODE not in {"constituent_sma"}:
             raise ValueError("STRATEGY_MODE must be 'constituent_sma'.")
         if self.SIGNAL_TYPE not in {"level", "cross"}:
@@ -192,8 +191,8 @@ class BacktestConfig:
             )
         if self.SNAPSHOT_LOCK_ID and not self.FREEZE_SNAPSHOTS:
             raise ValueError("SNAPSHOT_LOCK_ID requires FREEZE_SNAPSHOTS=True.")
-        if not self.has_crsp_credentials() and not self.EODHD_API_KEY:
-            raise ValueError("Provide CRSP/WRDS credentials or an EODHD_API_KEY.")
+        if not self.has_crsp_credentials():
+            raise ValueError("Provide CRSP/WRDS credentials; CRSP is the only price source.")
 
     def has_crsp_credentials(self) -> bool:
         """Return whether a WRDS/CRSP connection is plausibly available."""
@@ -237,7 +236,6 @@ def load_config() -> BacktestConfig:
         CRSP_USERNAME=os.getenv("CRSP_USERNAME"),
         WRDS_USERNAME=os.getenv("WRDS_USERNAME"),
         WRDS_PASSWORD=os.getenv("WRDS_PASSWORD"),
-        EODHD_API_KEY=os.getenv("EODHD_API_KEY"),
         FRED_API_KEY=os.getenv("FRED_API_KEY"),
     )
     cfg.END_DATE = resolve_date(cfg.END_DATE)
@@ -255,7 +253,6 @@ def config_hash(config: BacktestConfig) -> str:
     payload.pop("CRSP_USERNAME", None)
     payload.pop("WRDS_USERNAME", None)
     payload.pop("WRDS_PASSWORD", None)
-    payload.pop("EODHD_API_KEY", None)
     payload.pop("FRED_API_KEY", None)
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(serialized).hexdigest()
