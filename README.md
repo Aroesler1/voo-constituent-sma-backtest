@@ -49,9 +49,31 @@ The Deflated Sharpe asks whether the selected configuration's Sharpe survives th
 
 `statistics_mt.probability_of_backtest_overfitting` implements combinatorially symmetric cross-validation: the daily return panel is cut into 16 contiguous blocks, all C(16,8) = 12,870 ways of using half for training and the complement for testing are enumerated, and PBO is the share of those splits in which the in-sample winner ranked in the bottom half out of sample. CSCV is used rather than a single train/test cut because one cut point is arbitrary, and because the symmetric design means every block trains exactly as often as it tests.
 
-Two things about reading the number honestly. It is computed over the **five SMA lengths that already exist** (150/175/200/225/250) — widening the sweep would make PBO look more interesting without making it more informative. And with five configurations the out-of-sample rank takes only five values, so the logit is quantised and PBO is coarse: it is an indicator, not a precise probability.
+It is computed over the **five SMA lengths that already exist** (150/175/200/225/250), on 7,300 daily observations from 1996-01-02 to 2024-12-31. Widening the sweep would make PBO look more interesting without making it more informative.
 
-Reproduce, from the per-configuration daily returns `main.py` writes:
+| statistic | value |
+|---|---|
+| PBO | **0.613** |
+| median out-of-sample rank of the in-sample winner | **3.0 of 5** |
+| best in-sample configuration (full sample) | `sma_150` |
+| symmetric splits enumerated | 12,870 |
+
+**Read 0.613 against 0.60, not against 0.50.** With five configurations the out-of-sample rank takes five values, and "bottom half" means rank 3 or worse, so a ranking that carried *no* information at all would score 3/5 = 0.60. The observed 0.613 is that number. Picking the best SMA length in sample tells you nothing whatsoever about which length will do best out of sample, and the median out-of-sample rank of the in-sample winner is exactly the median rank.
+
+That sits beside the Deflated Sharpe rather than contradicting it, because the two measure different things:
+
+| | question | answer |
+|---|---|---|
+| Deflated Sharpe 0.985 | does the *selected* configuration's Sharpe survive the fact that nine were tried? | yes — the search did not manufacture it |
+| PBO 0.613 | does the in-sample *ranking* predict the out-of-sample ranking? | no — it is indistinguishable from noise |
+
+The configuration search did not invent the result, and the configuration choice is also worthless. Both are consistent with the headline: there is no edge here to select over. It is also why the 200-day being pre-specified matters more than its rank — at an annualised Sharpe of 0.5630 it places 4th of the 5 lengths (150: 0.5944, 175: 0.5854, 250: 0.5755, 200: 0.5630, 225: 0.5625), and PBO says that ordering would not repeat.
+
+Reproduce. `main.py` writes the per-configuration daily returns as `output/sma_sweep_returns.csv` (the full pipeline takes about nine minutes and needs a WRDS entitlement); `run_pbo.py` then needs nothing else:
+
+```bash
+python main.py
+```
 
 ```bash
 python run_pbo.py
