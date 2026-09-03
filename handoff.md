@@ -31,23 +31,38 @@ Done:
 
 - `.venv/bin/python -m pytest tests -q` -> **36 passed** (was 21).
 
-## OPEN: the PBO number is not in the README yet
+## PBO result (run completed 2026-09-03)
 
-The brief assumed the per-configuration daily return series were "already
-produced". They are not persisted anywhere. `main.py` built
-`sweep_excess_returns` in memory and only ever wrote summary statistics
-(`sma_sweep.csv`, `romano_wolf_sweep.csv`); `output/` is gitignored in any case.
-So PBO cannot be computed from anything currently on disk.
+`./.venv/bin/python main.py` completed in **533.6 s** (not the ~2 h the earlier
+output timestamps suggested), then `run_pbo.py`:
 
-`main.py` now writes `output/sma_sweep_returns.csv`, so **one full backtest run
-produces the input and `run_pbo.py` then reports the number**. That run is the
-blocker: the previous one took roughly two hours (output timestamps 11:41 ->
-13:42), and `config.END_DATE` defaults to "today" while the CRSP cache ends
-2026-03-18, so a rerun would either hit WRDS for the tail or fall back to cache
-via the graceful-degradation path in `data_loader.fetch_crsp_daily`.
+- **PBO = 0.613** over 7,300 daily observations, 1996-01-02 to 2024-12-31,
+  16 blocks, 12,870 symmetric splits, 7,296 observations used.
+- median out-of-sample rank of the in-sample winner: **3.0 of 5**
+- best in-sample configuration on the full sample: `sma_150`
+- annualised Sharpe by length: 150 0.5944, 175 0.5854, 250 0.5755,
+  200 0.5630, 225 0.5625 -- so the pre-specified 200-day is 4th of 5,
+  confirming the claim already in the README.
+- Romano-Wolf reproduced exactly: **0 of 5** significant vs the benchmark.
 
-No PBO number has been invented in the meantime. The README describes the
-method, cites the paper, and documents `run_pbo.py`; only the value is absent.
+**Read 0.613 against 0.60, not 0.50.** With five configurations "bottom half"
+means rank 3 or worse, so a completely uninformative ranking scores 3/5 = 0.60.
+The observed value is that number: the in-sample ranking carries no
+out-of-sample information. This is now in the README next to the Deflated
+Sharpe of 0.985, with the point that the two are consistent -- the search did
+not manufacture the result, and the configuration choice is also worthless,
+because there is no edge to select over.
+
+The brief assumed the per-configuration daily returns were "already produced".
+They were not persisted anywhere: `main.py` built them in memory and wrote only
+summary statistics. `main.py` now writes `output/sma_sweep_returns.csv`.
+
+**`output/sma_sweep_returns.csv` is NOT committed.** `output/` is gitignored
+wholesale. DATA.md's stated policy is that "only derived outputs are published"
+and a portfolio-level daily return panel is a long way from raw CRSP, so
+committing the 872 KB file would be defensible and would let PBO reproduce from
+a clone without a WRDS entitlement. Not done unilaterally -- it is a
+publish-licensed-derivative decision for the repository owner.
 
 ## Notes on reading PBO here
 
