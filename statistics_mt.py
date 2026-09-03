@@ -11,6 +11,7 @@ whose NormalDist we use.
 
 from __future__ import annotations
 
+import itertools
 import math
 from statistics import NormalDist
 from typing import Optional, Sequence
@@ -187,3 +188,122 @@ def romano_wolf_stepdown(
         "rejected_at_step": [rejected_step[c] for c in columns],
         "significant": [rejected_step[c] > 0 for c in columns],
     }).sort_values("t_stat", ascending=False).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Probability of Backtest Overfitting (CSCV)
+# ---------------------------------------------------------------------------
+
+
+def probability_of_backtest_overfitting(
+    returns: pd.DataFrame,
+    n_splits: int = 16,
+) -> dict:
+    """PBO via combinatorially symmetric cross-validation.
+
+    Bailey, Borwein, Lopez de Prado & Zhu, "The Probability of Backtest
+    Overfitting", Journal of Computational Finance 20(4), 2017.
+
+    The Deflated Sharpe Ratio asks whether the SELECTED configuration's Sharpe
+    survives the fact that N were tried. PBO asks a sharper question about the
+    selection procedure itself: if you pick the best configuration in sample,
+    how often does it land in the bottom half out of sample? A PBO near 0.5 says
+    the in-sample ranking carries no information about out-of-sample ranking,
+    which is what overfitting looks like from the outside.
+
+    CSCV avoids the arbitrariness of a single train/test cut. The sample is
+    split into `n_splits` contiguous blocks; every way of choosing half of them
+    as the training set is enumerated, with the complement as the test set. That
+    is symmetric (each block appears in training exactly as often as in testing)
+    and it uses the whole sample rather than privileging one split point.
+
+    For each combination the in-sample best configuration n* is found, its
+    out-of-sample rank r among the N configurations is taken (1 = worst), and
+    the relative rank omega = r / (N + 1) is mapped to the logit
+    lambda = log(omega / (1 - omega)). PBO is the fraction of combinations with
+    lambda <= 0.
+
+    Parameters
+    ----------
+    returns : DataFrame
+        One column per configuration, one row per period. Columns must be the
+        SAME strategy family evaluated on the SAME dates, which is what makes
+        the rank comparison meaningful.
+    n_splits : int
+        Number of contiguous blocks; must be even. 16 gives C(16,8) = 12,870
+        combinations, the value used in the original paper.
+
+    Returns
+    -------
+    dict with `pbo`, `n_combinations`, `n_configs`, `median_oos_rank`,
+    `logits` and `oos_ranks`.
+
+    A caveat that matters when N is small: the out-of-sample rank can only take
+    N distinct values, so PBO is quantized. With five configurations omega is
+    one of {1/6, ..., 5/6} and lambda <= 0 means "ranked third or worse of
+    five", the median rank included. PBO is coarse here and should be read as
+    an indicator, not a precise probability.
+    """
+    frame = returns.apply(pd.to_numeric, errors="coerce")
+    frame = frame.dropna(how="all").dropna(axis=1, how="all").fillna(0.0)
+    n_obs, n_cfg = frame.shape
+    if n_cfg < 2:
+        raise ValueError("need at least 2 configurations")
+    if n_splits % 2 != 0:
+        raise ValueError("n_splits must be even so the halves are the same size")
+    if n_obs < 2 * n_splits:
+        raise ValueError(f"need at least {2 * n_splits} observations for {n_splits} splits")
+
+    rows_per_block = n_obs // n_splits
+    usable = rows_per_block * n_splits
+    # Trailing observations that do not fill a whole block are dropped rather
+    # than folded into the last one, which would make the blocks unequal and
+    # break the symmetry the procedure is named for.
+    values = frame.to_numpy(dtype=float)[:usable]
+    blocks = values.reshape(n_splits, rows_per_block, n_cfg)
+
+    # Block-level sufficient statistics: any union of blocks has an exact mean
+    # and variance from these, so no combination needs to materialise its data.
+    counts = np.full(n_splits, rows_per_block, dtype=float)
+    sums = blocks.sum(axis=1)
+    sumsq = (blocks ** 2).sum(axis=1)
+
+    def _sharpe(selected: list[int]) -> np.ndarray:
+        n = counts[selected].sum()
+        total = sums[selected].sum(axis=0)
+        total_sq = sumsq[selected].sum(axis=0)
+        mean = total / n
+        var = (total_sq - n * mean ** 2) / (n - 1.0)
+        std = np.sqrt(np.maximum(var, 0.0))
+        return np.divide(mean, std, out=np.zeros_like(mean), where=std > 0)
+
+    half = n_splits // 2
+    all_blocks = set(range(n_splits))
+    logits: list[float] = []
+    oos_ranks: list[int] = []
+
+    for train in itertools.combinations(range(n_splits), half):
+        train_list = list(train)
+        test_list = sorted(all_blocks - set(train))
+
+        best = int(np.argmax(_sharpe(train_list)))
+        sr_oos = _sharpe(test_list)
+        # ranks 1..N with 1 = worst; ties broken by position, which is
+        # immaterial at N=5 and avoids a fractional rank the logit cannot take
+        rank = int(np.argsort(np.argsort(sr_oos))[best]) + 1
+
+        omega = rank / (n_cfg + 1.0)
+        logits.append(float(np.log(omega / (1.0 - omega))))
+        oos_ranks.append(rank)
+
+    logit_arr = np.asarray(logits, dtype=float)
+    return {
+        "pbo": float(np.mean(logit_arr <= 0.0)),
+        "n_combinations": len(logits),
+        "n_configs": n_cfg,
+        "n_splits": n_splits,
+        "obs_used": usable,
+        "median_oos_rank": float(np.median(oos_ranks)),
+        "logits": logit_arr,
+        "oos_ranks": np.asarray(oos_ranks, dtype=int),
+    }
