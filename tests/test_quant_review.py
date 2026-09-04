@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -120,3 +121,40 @@ def test_round_trips_carry_pnl_for_concentration():
     top_share = pnl.sort_values(ascending=False).iloc[:2].sum() / pnl[pnl > 0].sum()
     # the single big winner dominates gross profit
     assert top_share > 0.9
+
+
+def test_annualised_cost_is_scaled_by_trading_days_not_trade_days():
+    """A strategy that trades rarely must not be charged as if it traded daily.
+
+    The metric previously averaged the cost rate over the days that traded and
+    then multiplied by 252, which prices a semi-monthly rebalance as a daily
+    one. On the headline configuration that reported 758 bps a year against a
+    true drag of 74 bps measured by rerunning with costs switched off.
+    """
+    from metrics import compute_metrics  # noqa: PLC0415
+
+    idx = pd.bdate_range("2020-01-01", periods=252)
+    equity = pd.Series(1_000_000.0, index=idx)
+    returns = pd.Series(0.0, index=idx)
+    positions = pd.Series(1, index=idx, dtype="Int64")
+
+    # Twelve trade days in a 252-day year, each costing 10 bps of NAV.
+    trade_dates = idx[::21]
+    trades = pd.DataFrame(
+        {
+            "date": trade_dates,
+            "ticker": "AAA",
+            "direction": "BUY",
+            "price": 100.0,
+            "trade_notional": 1_000.0,
+            "total_cost_bps": 10.0,
+            "total_cost_usd": 1_000_000.0 * 10.0 / 10_000.0,
+            "equity_before": 1_000_000.0,
+        }
+    )
+
+    met = compute_metrics(equity, returns, trades, positions, cash_rate=0.0)
+    expected_bps = len(trade_dates) * 10.0  # twelve rebalances at 10 bps each
+    assert met["total_cost_bps_annualized"] == pytest.approx(expected_bps, rel=1e-9)
+    # The old behaviour would have reported 252/12 times this.
+    assert met["total_cost_bps_annualized"] < expected_bps * 5

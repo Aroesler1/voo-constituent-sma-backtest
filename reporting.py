@@ -634,3 +634,67 @@ def write_detailed_report(
     report_path.write_text("\n".join(lines), encoding="utf-8")
     LOGGER.info("Saved detailed markdown report: %s", report_path)
     return report_path
+
+
+def plot_timing_luck_box(
+    variants: pd.DataFrame,
+    index_cagr: float,
+    output_dir: str,
+    filename: str = "timing_luck_box.png",
+) -> None:
+    """Box plot of CAGR across evaluation days, one box per SMA length.
+
+    The horizontal line is the index. A box that straddles it means the same
+    rule beats or loses to buy-and-hold depending only on which day of the
+    period the signal is acted on.
+
+    Args:
+        variants: One row per (sma_length, schedule) with a ``cagr`` column.
+        index_cagr: Buy-and-hold CAGR of the benchmark.
+        output_dir: Output directory.
+        filename: Output file name.
+    """
+    out_dir = _ensure_output_dir(output_dir)
+
+    if variants.empty:
+        LOGGER.warning("Timing-luck variants empty; skipping box plot.")
+        return
+
+    lengths = sorted(variants["sma_length"].astype(int).unique())
+    data = [variants.loc[variants["sma_length"].astype(int) == n, "cagr"].astype(float).to_numpy() for n in lengths]
+    daily = [
+        variants.loc[
+            (variants["sma_length"].astype(int) == n) & (variants["label"] == "daily"), "cagr"
+        ].astype(float).to_numpy()
+        for n in lengths
+    ]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    positions = np.arange(1, len(lengths) + 1)
+    ax.boxplot(data, positions=positions, widths=0.55, showfliers=True)
+
+    for pos, values in zip(positions, data):
+        jitter = (np.random.default_rng(0).random(len(values)) - 0.5) * 0.28
+        ax.scatter(pos + jitter, values, s=12, alpha=0.45, color="#1f78b4", zorder=3)
+
+    for pos, values in zip(positions, daily):
+        if len(values):
+            ax.scatter(pos, values[0], marker="D", s=48, color="#e31a1c", zorder=4,
+                       label="daily rule" if pos == positions[0] else None)
+
+    ax.axhline(float(index_cagr), color="#33a02c", linestyle="--", linewidth=1.6,
+               label=f"S&P 500 TR ({index_cagr:.2%})")
+    ax.set_xticks(positions)
+    ax.set_xticklabels([str(n) for n in lengths])
+    ax.set_xlabel("SMA length (trading days)")
+    ax.set_ylabel("CAGR")
+    ax.set_title("Rebalance timing luck: CAGR across 27 signal-evaluation days")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(loc="best", frameon=False)
+
+    save_path = out_dir / filename
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
+
+    LOGGER.info("Saved timing-luck box plot: %s", save_path)
