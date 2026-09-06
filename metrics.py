@@ -264,6 +264,12 @@ def compute_metrics(
             if daily_nav is not None and len(daily_nav.dropna()) > 0:
                 cost_rate = (daily_cost / daily_nav).replace([np.inf, -np.inf], np.nan).dropna()
                 if len(cost_rate) > 0:
+                    # Annualise over every trading day, not only the days that
+                    # traded. Averaging over trade days and then scaling by 252
+                    # prices the strategy as if it rebalanced daily: on the
+                    # semi-monthly schedule, which trades on 9% of sessions, that
+                    # overstated the drag by more than a factor of ten.
+                    cost_rate = cost_rate.reindex(eq.index).fillna(0.0)
                     total_cost_bps_annualized = float(cost_rate.mean() * periods_per_year * 10000.0)
             elif initial > 0:
                 total_cost_usd = float(pd.to_numeric(tr["total_cost_usd"], errors="coerce").sum())
