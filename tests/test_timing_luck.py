@@ -266,10 +266,104 @@ def test_summary_scales_the_range_against_the_gap_to_the_index():
     assert row["cagr_daily"] == pytest.approx(0.06)
     assert row["cagr_range"] == pytest.approx(0.03)
     assert row["gap_daily_to_index"] == pytest.approx(0.04)
-    assert row["range_over_gap"] == pytest.approx(0.75)
+    assert row["range_over_daily_gap"] == pytest.approx(0.75)
     assert row["sharpe_range"] == pytest.approx(0.15)
+    # No headline row present, so its columns are absent rather than invented.
+    assert pd.isna(row["cagr_headline"])
+    assert pd.isna(row["range_over_headline_gap"])
 
 
 def test_summary_requires_the_expected_columns():
     with pytest.raises(ValueError):
         timing_luck_summary(pd.DataFrame({"sma_length": [200], "cagr": [0.1]}), index_cagr=0.1)
+
+
+# ---------------------------------------------------------------------------
+# The headline schedule, carried alongside the 27
+# ---------------------------------------------------------------------------
+
+
+def test_headline_schedule_is_not_one_of_the_anchors():
+    from timing_luck import HEADLINE_SCHEDULE  # noqa: PLC0415
+
+    assert HEADLINE_SCHEDULE.label == "semi_monthly"
+    assert HEADLINE_SCHEDULE.is_anchor_variant is False
+    assert HEADLINE_SCHEDULE not in enumerate_schedules()
+    assert all(s.is_anchor_variant for s in enumerate_schedules())
+
+
+def test_headline_calendar_matches_the_pipeline_builder():
+    """The headline row must be the headline, not a reimplementation of it."""
+    from preprocessing import build_rebalance_calendar  # noqa: PLC0415
+    from timing_luck import HEADLINE_SCHEDULE  # noqa: PLC0415
+
+    idx = _calendar("2015-01-05", 1500)
+    pd.testing.assert_index_equal(
+        build_evaluation_calendar(idx, HEADLINE_SCHEDULE),
+        build_rebalance_calendar(idx, "semi_monthly"),
+    )
+
+
+def test_headline_schedule_rejects_an_anchor():
+    with pytest.raises(ValueError):
+        EvaluationSchedule("semi_monthly", 3)
+
+
+def test_summary_excludes_non_anchor_rows_from_the_dispersion():
+    """Adding the headline row must not move the range it is compared against."""
+    anchors = pd.DataFrame(
+        {
+            "sma_length": [200] * 3,
+            "label": ["daily", "weekly_01", "monthly_07"],
+            "is_anchor_variant": [True, True, True],
+            "cagr": [0.06, 0.05, 0.08],
+            "sharpe": [0.30, 0.25, 0.40],
+        }
+    )
+    base = timing_luck_summary(anchors, index_cagr=0.10).iloc[0]
+
+    # A headline row far outside the anchor range, which would widen it if the
+    # summary counted it.
+    with_headline = pd.concat(
+        [
+            anchors,
+            pd.DataFrame(
+                {
+                    "sma_length": [200],
+                    "label": ["semi_monthly"],
+                    "is_anchor_variant": [False],
+                    "cagr": [0.20],
+                    "sharpe": [0.90],
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+    out = timing_luck_summary(with_headline, index_cagr=0.10).iloc[0]
+
+    assert out["n_variants"] == 3
+    assert out["cagr_range"] == pytest.approx(base["cagr_range"])
+    assert out["sharpe_range"] == pytest.approx(base["sharpe_range"])
+    assert out["cagr_max"] == pytest.approx(0.08)
+
+
+def test_summary_scales_the_range_against_the_headline_gap_too():
+    variants = pd.DataFrame(
+        {
+            "sma_length": [200] * 4,
+            "label": ["daily", "weekly_01", "monthly_07", "semi_monthly"],
+            "is_anchor_variant": [True, True, True, False],
+            "cagr": [0.06, 0.05, 0.08, 0.084],
+            "sharpe": [0.30, 0.25, 0.40, 0.36],
+        }
+    )
+    row = timing_luck_summary(variants, index_cagr=0.10).iloc[0]
+
+    assert row["cagr_headline"] == pytest.approx(0.084)
+    assert row["gap_headline_to_index"] == pytest.approx(0.016)
+    assert row["range_over_headline_gap"] == pytest.approx(0.03 / 0.016)
+    # The daily-gap scaling is unchanged by the extra row.
+    assert row["gap_daily_to_index"] == pytest.approx(0.04)
+    assert row["range_over_daily_gap"] == pytest.approx(0.75)
+    # Headline sits above all three anchors here, so it ranks 4th of 3 + itself.
+    assert row["headline_rank_among_anchors"] == 4

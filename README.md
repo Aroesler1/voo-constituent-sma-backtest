@@ -15,7 +15,7 @@ That last item is what this repository is currently most useful for. The strateg
 
 ## Regenerated results (2026-09): the strategy loses to the index
 
-Rerun after the data-integrity audit below, on 1,148 CRSP-resolved constituents, 7,300 trading days, 21,836 trades.
+Rerun after the data-integrity audit below, on 1,133 CRSP-resolved constituents, 7,300 trading days, 21,836 trades. Every table in this section is on the legacy `crsp.dsf` tape with `config.END_DATE` pinned to 2024-12-31.
 
 | metric | Strategy | S&P 500 total return |
 |---|---|---|
@@ -89,7 +89,7 @@ This result is not news, and presenting it as this repository's finding would ov
 
 ### Caveats on these numbers
 
-- **The sample effectively ends 2024-12-31, not 2026.** CRSP's coverage stops there while the configured end date runs later, so every current constituent is flagged as needing a "recent tail" it cannot get. An earlier draft of this section described that as a 32% coverage gap; it was not. 1,148 tickers resolved and 1,064 actually traded, with trades running 1996-10-15 to 2024-12-16. Only **51** tickers genuinely never appear in CRSP's name history, and most of those are delisted shells (`AAMRQ`, `ABKFQ`) rather than live constituents.
+- **The sample ends 2024-12-31 because that is where the end date is configured.** `config.END_DATE` is pinned to the last date the legacy CRSP tape carries; extending past it means moving to the CIZ tape (`crsp_v2.py`), not moving the string. Override it with `BACKTEST_END_DATE` if you have a reason to. It previously resolved to `"today"`, which produced two artefacts now gone: every current constituent was flagged as needing a "recent tail" this tape does not have, and the run was not reproducible, because the snapshot gate rejects any cached snapshot whose requested end predates the request, so the benchmarks refetched from WRDS at every date rollover. An earlier draft read the first artefact as a 32% coverage gap; it was not one. Under the pin the coverage report is clean, **1,133** tickers resolve and 1,064 actually trade, with trades running 1996-10-15 to 2024-12-16. **48** tickers never appear in CRSP's name history at all, mostly delisted shells (`AAMRQ`, `ABKFQ`) rather than live constituents.
 - **EODHD was removed entirely (2026-09).** The loader previously fell back to a
   second vendor for tickers CRSP could not resolve, and spliced a vendor tail onto
   CRSP history for current constituents. Both are gone: unresolved tickers are now
@@ -105,21 +105,27 @@ Everything above reports one signal-evaluation schedule. Hoffstein, Sibears and 
 
 `timing_luck.py` adds an evaluation-schedule option and runs all five SMA lengths against all 27 schedules: daily, five weekly anchors, and twenty-one monthly anchors. Anchors are trading-day ordinals rather than calendar weekdays, so every variant rebalances exactly once per period and the sweep varies *which* day without varying *how often*.
 
-| SMA | daily rule | worst of 27 | best of 27 | CAGR range | CAGR s.d. | Sharpe range | gap, daily rule to index | range / gap |
-|---|---|---|---|---|---|---|---|---|
-| 150 | 4.93% | 4.93% | 9.82% | **4.89 pp** | 1.06 pp | 0.278 | 5.04 pp | **0.97** |
-| 175 | 5.53% | 5.53% | 9.75% | 4.22 pp | 0.91 pp | 0.241 | 4.45 pp | 0.95 |
-| 200 | 5.73% | 5.73% | 9.60% | 3.86 pp | 0.84 pp | 0.221 | 4.24 pp | 0.91 |
-| 225 | 5.49% | 5.49% | 9.47% | 3.98 pp | 0.82 pp | 0.228 | 4.49 pp | 0.89 |
-| 250 | 5.31% | 5.31% | 9.44% | 4.13 pp | 0.83 pp | 0.240 | 4.67 pp | 0.88 |
+The headline schedule is carried alongside them as a 28th labelled row. It is not a 28th anchor: semi-monthly fires twice a month, so it is a frequency the anchor sweep does not contain. It is excluded from every dispersion statistic below and reported only to locate the headline inside the sweep.
+
+| SMA | daily rule | **headline (semi-monthly)** | worst of 27 | best of 27 | CAGR range | CAGR s.d. | Sharpe range | gap, daily to index | range / daily gap | gap, headline to index | range / headline gap |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 150 | 4.93% | 9.07% | 4.93% | 9.82% | **4.89 pp** | 1.06 pp | 0.278 | 5.04 pp | **0.97** | 0.90 pp | **5.41** |
+| 175 | 5.53% | 8.86% | 5.53% | 9.75% | 4.22 pp | 0.91 pp | 0.241 | 4.45 pp | 0.95 | 1.11 pp | 3.79 |
+| 200 | 5.73% | **8.40%** | 5.73% | 9.60% | 3.86 pp | 0.84 pp | 0.221 | 4.24 pp | 0.91 | **1.58 pp** | **2.44** |
+| 225 | 5.49% | 8.36% | 5.49% | 9.47% | 3.98 pp | 0.82 pp | 0.228 | 4.49 pp | 0.89 | 1.62 pp | 2.46 |
+| 250 | 5.31% | 8.58% | 5.31% | 9.44% | 4.13 pp | 0.83 pp | 0.240 | 4.67 pp | 0.88 | 1.39 pp | 2.97 |
 
 ![CAGR of the constituent SMA rule across all 27 signal-evaluation days, per SMA length, against the index](figures/timing_luck_box.png)
+
+**Where the headline sits.** The 8.40% this README leads with is the 200-day rule evaluated **semi-monthly**, which is `config.REBALANCE_DEFAULT` and is not one of the 27 anchors in the sweep. Placed among them it ranks **9th lowest of 27**: nineteen anchor schedules would have produced a higher CAGR for the same rule on the same data, and the best of them reaches 9.60% against the headline's 8.40%. It is not the unluckiest calendar available, which the daily rule is, but it sits in the bottom third of them.
+
+That matters most for the error bar that actually applies to the headline. The gap from 8.40% to the index's 9.98% is **1.58 pp**, and the spread across evaluation days at 200 days is 3.86 pp: the calendar-choice dispersion is **2.44 times the shortfall the number is quoted to demonstrate**. Scaled against the daily rule the ratio is 0.91 and reads as "nearly all of it"; scaled against the headline it is greater than one at every length, from 2.44 at 200 days to 5.41 at 150. Either scaling says the same thing, and the second says it about the number on the first screen of this README.
 
 Three things fall out of that table.
 
 **The dispersion is nearly the whole result.** At every length the CAGR range across evaluation days is 88% to 97% of the entire gap between the daily rule and buy-and-hold. A reader handed the daily-evaluation number alone would be reading a quantity whose calendar-choice error bar is almost as wide as the effect being reported.
 
-**Daily evaluation is the worst of the 27 at every single length.** Not near the bottom, the bottom: rank 1 of 27 for 150, 175, 200, 225 and 250 alike. The best variant is a monthly anchor in all five cases. That is not a coincidence of anchor choice, it is turnover: at 200 days the daily rule turns over 16.0 times a year against 3.1 for the monthly anchors, which at roughly 15 bps a trade is 240 bps of annual cost against 46 bps. That cost gap accounts for 42% to 50% of the spread at each length, so it is the largest single driver and not the whole of it; the rest is the rule acting on a different price.
+**Daily evaluation is the worst of the 27 at every single length.** Not near the bottom, the bottom: rank 1 of 27 for 150, 175, 200, 225 and 250 alike. The best variant is a monthly anchor in all five cases. That is not a coincidence of anchor choice, it is turnover. **At the 200-day length** the daily rule turns over 16.0 times a year against 3.1 for the monthly anchors, which at roughly 15 bps a trade is 240 bps of annual cost against 46 bps. That cost gap accounts for 42% to 50% of the spread at each length, so it is the largest single driver and not the whole of it; the rest is the rule acting on a different price.
 
 **None of it rescues the strategy.** The luckiest calendar at the luckiest length reaches 9.82% against the index's 9.98%. The box does not straddle the benchmark line at any length. Timing luck is large enough to dominate the reported shortfall and not large enough to reverse the conclusion, which is the honest thing to say about it: the result is robust to the calendar in sign and worthless in magnitude.
 
@@ -156,7 +162,7 @@ Where the constituent version loses, it loses on cost, not on signal. Rerunning 
 | 225 | 1.77 pp | +0.33 pp | +1.44 pp |
 | 250 | 1.83 pp | +0.31 pp | +1.52 pp |
 
-The cost component is 1.4 to 1.7 pp at every length and swamps the other term. The whipsaw component is small, and at 150 and 175 days it is **negative**: gross of costs, running the rule name by name *beat* running it on the index. Applying a moving average to 500 stocks instead of to their index is not a worse signal here. It is a signal that costs two to three times as much to run, at 19.5 turns a year against 9.5 and wearing per-name spreads instead of an ETF's.
+The cost component is 1.4 to 1.7 pp at every length and swamps the other term. The whipsaw component is small, and at 150 and 175 days it is **negative**: gross of costs, running the rule name by name *beat* running it on the index. Applying a moving average to 500 stocks instead of to their index is not a worse signal here. It is a signal that costs two to three times as much to run: **at the 150-day length** the constituent version turns over 19.5 times a year against the index version's 9.5, and it wears per-name spreads instead of an ETF's.
 
 ## A timing rule that does work, as the control
 
@@ -195,6 +201,8 @@ A third leg was run and is reported in `output/vol_managed_control.csv` but is n
 In January 2025 CRSP shipped the last release of Flat File Format 1.0 (SIZ) and now updates only Format 2.0 (CIZ). Schwarz, Walter and Weiss, ["Rewriting CRSP's History: Impact of Altered Monthly Returns on Asset Pricing"](https://doi.org/10.2139/ssrn.5074864) (*Journal of Financial and Quantitative Analysis*, 24 February 2026), measure the consequence: the transition "rewrites 9.62% of monthly returns by more than 1 basis point, primarily due to a change in the dividend reinvestment assumption", payouts reinvesting on the ex-date under CIZ against month-end under SIZ, with a 22 bp mean absolute difference among the altered returns and 11.43% of monthly long-short returns moving by more than 10 bps.
 
 The same paper contains a prediction this repository is well placed to test. The reinvestment change is a *monthly* artefact, daily returns "did not change materially", and the authors rebuild CIZ monthly returns by compounding SIZ daily ones. A strategy evaluated on daily data should therefore be close to tape-invariant. `crsp_v2.py` re-pulls the whole constituent panel from `crsp.dsf_v2` and `run_tape_compare.py` reruns the headline configuration on both, holding the ticker-to-PERMNO resolution and the entire normalisation path fixed so that only CRSP's numbers change.
+
+This table is the one place in the README still on the **pre-pin** configured end date of 2026-09-04, which is why it resolves 1,148 tickers where the headline resolves 1,133. The pin truncates the SEC holdings proxy at 2024-12-31 and drops 15 names that join the index after the sample ends and therefore never hold a position in it. Rerunning the comparison under the pin is pending a WRDS credential.
 
 | | legacy `crsp.dsf` | CIZ `crsp.dsf_v2` |
 |---|---|---|
@@ -341,6 +349,7 @@ Default reporting schedule is `semi_monthly`, with full comparisons against `dai
 - **CIZ delisting returns are not yet bridged.** `crsp.dsf_v2.dlyret` excludes the delisting return that the legacy path compounds in from `crsp.dsedelist`, so the v2 panel understates the loss on a delisted name's final day. This affects one row per delisted security, 350 of the 671 altered constituent-days, and makes the reported tape agreement a lower bound.
 - **The volatility-managed control is only a control.** It is reported to show the pipeline can detect a timing effect the literature documents. It works on the index at monthly rebalancing and fails at daily rebalancing and on the constituent portfolio, and inverse-variance scaling is undefined in any useful sense on a long/flat series that parks in cash.
 - The cash sleeve borrows at the three-month bill rate when the volatility overlay levers up to its 1.5 cap. A retail account pays more, so that leg is flattered.
+- **A fully cached run still reaches for WRDS once.** The 48 tickers CRSP cannot resolve never acquire a snapshot, so the loader treats them as missing on every run, opens a connection for them and degrades to cache when it fails. Nothing else in the pipeline needs the network once the cache is warm. A negative cache for permanently unresolvable tickers would close this; it is not written yet.
 
 ## Setup
 
@@ -378,6 +387,21 @@ Run the unit tests (no credentials required):
 ```
 
 ## Generated Outputs
+
+`output/` is gitignored and regenerating it needs a WRDS entitlement, so the small derived tables every number in this README is quoted from are committed to **`reports/`** as well. They are portfolio-level aggregates and difference counts only; no CRSP row and nothing under `data_cache/` is ever written there. `output/tape_largest_differences.csv` is the one table deliberately left out, because it carries raw CRSP returns per ticker-day.
+
+```text
+reports/
+  timing_luck_variants.csv                  140 rows: 5 lengths x (27 anchors + the headline schedule)
+  timing_luck_summary.csv                   dispersion per length, both range-over-gap scalings
+  index_vs_stock.csv                        index and constituent rules, costs on and off
+  index_vs_stock_decomposition.csv          shortfall split into cost and whipsaw
+  vol_managed_control.csv                   the positive control, gross and net, both update frequencies
+  vol_managed_romano_wolf.csv               family-wise test over the control legs
+  tape_comparison.csv                       headline on both CRSP tapes
+  tape_return_differences.csv               altered constituent-day counts
+  tape_return_differences_ex_final_day.csv  the same, excluding each security's delisting row
+```
 
 Successful runs write artifacts to `output/`, including:
 
