@@ -22,7 +22,15 @@ class BacktestConfig:
 
     # Data
     START_DATE: str = "1993-01-29"
-    END_DATE: str = "today"
+    # Pinned to the last date the legacy CRSP tape (crsp.dsf) carries. It used
+    # to resolve to "today", which made every run non-reproducible: the snapshot
+    # coverage gate requires a snapshot whose requested end is at or after the
+    # requested one, so at each date rollover the cached benchmarks stopped
+    # resolving and the loader went back to WRDS for data that had not changed.
+    # Extending the sample past this date means moving to the CIZ tape
+    # (crsp.dsf_v2, see crsp_v2.py), not moving this string. Override with the
+    # BACKTEST_END_DATE environment variable; "today" is still accepted.
+    END_DATE: str = "2024-12-31"
     VOO_INCEPTION: str = "2010-09-09"
     TICKERS: list[str] = field(default_factory=lambda: ["SPY", "VOO"])
     CACHE_DIR: str = "./data_cache"
@@ -232,6 +240,7 @@ def get_periods() -> dict[str, tuple[str, str]]:
 def load_config() -> BacktestConfig:
     """Load runtime configuration from defaults and environment."""
     cfg = BacktestConfig(
+        END_DATE=os.getenv("BACKTEST_END_DATE", BacktestConfig.END_DATE),
         CRSP_API_KEY=os.getenv("CRSP_API_KEY"),
         CRSP_USERNAME=os.getenv("CRSP_USERNAME"),
         WRDS_USERNAME=os.getenv("WRDS_USERNAME"),
