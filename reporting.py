@@ -660,11 +660,24 @@ def plot_timing_luck_box(
         LOGGER.warning("Timing-luck variants empty; skipping box plot.")
         return
 
-    lengths = sorted(variants["sma_length"].astype(int).unique())
-    data = [variants.loc[variants["sma_length"].astype(int) == n, "cagr"].astype(float).to_numpy() for n in lengths]
-    daily = [
+    # The boxes are the anchor variants. A non-anchor reference row (the
+    # semi-monthly headline) rides in the same frame and must not widen them.
+    if "is_anchor_variant" in variants.columns:
+        anchors = variants.loc[variants["is_anchor_variant"].astype(bool)]
+    else:
+        anchors = variants
+
+    lengths = sorted(anchors["sma_length"].astype(int).unique())
+    data = [anchors.loc[anchors["sma_length"].astype(int) == n, "cagr"].astype(float).to_numpy() for n in lengths]
+    headline = [
         variants.loc[
-            (variants["sma_length"].astype(int) == n) & (variants["label"] == "daily"), "cagr"
+            (variants["sma_length"].astype(int) == n) & (variants["label"] == "semi_monthly"), "cagr"
+        ].astype(float).to_numpy()
+        for n in lengths
+    ]
+    daily = [
+        anchors.loc[
+            (anchors["sma_length"].astype(int) == n) & (anchors["label"] == "daily"), "cagr"
         ].astype(float).to_numpy()
         for n in lengths
     ]
@@ -681,6 +694,11 @@ def plot_timing_luck_box(
         if len(values):
             ax.scatter(pos, values[0], marker="D", s=48, color="#e31a1c", zorder=4,
                        label="daily rule" if pos == positions[0] else None)
+
+    for pos, values in zip(positions, headline):
+        if len(values):
+            ax.scatter(pos, values[0], marker="*", s=110, color="#6a3d9a", zorder=5,
+                       label="headline (semi-monthly)" if pos == positions[0] else None)
 
     ax.axhline(float(index_cagr), color="#33a02c", linestyle="--", linewidth=1.6,
                label=f"S&P 500 TR ({index_cagr:.2%})")

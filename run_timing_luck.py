@@ -40,6 +40,7 @@ from spread_edge import edge_spread_series
 from statistics_mt import deflated_sharpe, per_period_sharpe, romano_wolf_stepdown
 from strategy import compute_sma_matrix, generate_active_mask
 from timing_luck import (
+    HEADLINE_SCHEDULE,
     EvaluationSchedule,
     build_evaluation_calendar,
     enumerate_schedules,
@@ -54,6 +55,19 @@ LOGGER = logging.getLogger(__name__)
 # scales its dispersion against the daily rule, so Parts 2 and 3 use the daily
 # rule too rather than the README's semi-monthly reporting default.
 REFERENCE_SCHEDULE = EvaluationSchedule("daily")
+
+#: Tracked copy of the summary tables. output/ is gitignored and needs a WRDS
+#: entitlement to regenerate, so the tables the README quotes are also written
+#: here and committed. These are portfolio-level aggregates only: no CRSP row
+#: and nothing from data_cache/ is ever written to this directory.
+REPORTS_DIR = Path("reports")
+
+
+def _write_table(frame: pd.DataFrame, out_dir: Path, name: str, index: bool = False) -> None:
+    """Write one derived table to output/ and to the tracked reports/ copy."""
+    frame.to_csv(out_dir / name, index=index)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(REPORTS_DIR / name, index=index)
 
 
 def _setup_logging(output_dir: str) -> None:
@@ -161,6 +175,7 @@ def run_schedule_sweep(
                     "frequency": schedule.frequency,
                     "anchor": schedule.anchor,
                     "label": schedule.label,
+                    "is_anchor_variant": bool(schedule.is_anchor_variant),
                     "cagr": met["cagr"],
                     "sharpe": met["sharpe"],
                     "annualized_vol": met["annualized_vol"],
@@ -602,13 +617,16 @@ def main() -> None:
 
     if "1" in parts:
         LOGGER.info("=== Part 1: rebalance timing luck ===")
+        # The 27 anchors, plus the semi-monthly schedule main.py reports. The
+        # headline is not an anchor variant and does not enter the dispersion
+        # statistics; it is run here so the README can say where it lands.
         variants = run_schedule_sweep(
-            panel, config, lengths, enumerate_schedules(),
+            panel, config, lengths, [*enumerate_schedules(), HEADLINE_SCHEDULE],
             checkpoint=out_dir / "timing_luck_variants.csv",
         )
-        variants.to_csv(out_dir / "timing_luck_variants.csv", index=False)
+        _write_table(variants, out_dir, "timing_luck_variants.csv")
         summary = timing_luck_summary(variants, index_cagr=index_cagr)
-        summary.to_csv(out_dir / "timing_luck_summary.csv", index=False)
+        _write_table(summary, out_dir, "timing_luck_summary.csv")
         plot_timing_luck_box(variants, index_cagr, config.OUTPUT_DIR)
         # output/ is gitignored, so the README's copy goes somewhere tracked.
         plot_timing_luck_box(variants, index_cagr, "figures")
@@ -621,9 +639,9 @@ def main() -> None:
         LOGGER.info("Index spread assumption: %s", spread_notes)
 
         levels = run_index_vs_stock(panel, config, lengths, spread_bps)
-        levels.to_csv(out_dir / "index_vs_stock.csv", index=False)
+        _write_table(levels, out_dir, "index_vs_stock.csv")
         decomposition = decompose_shortfall(levels)
-        decomposition.to_csv(out_dir / "index_vs_stock_decomposition.csv", index=False)
+        _write_table(decomposition, out_dir, "index_vs_stock_decomposition.csv")
         LOGGER.info("Part 2 decomposition:\n%s", decomposition.to_string(index=False))
 
     if "3" in parts:
@@ -668,7 +686,7 @@ def main() -> None:
         # family of overlays against their own buy-and-hold, then a Deflated
         # Sharpe for each with the whole family as the trial pool.
         rw = romano_wolf_stepdown(excess_panel, alpha=0.05, n_boot=1000)
-        rw.to_csv(out_dir / "vol_managed_romano_wolf.csv", index=False)
+        _write_table(rw, out_dir, "vol_managed_romano_wolf.csv")
         LOGGER.info("Vol-managed Romano-Wolf:\n%s", rw.to_string(index=False))
 
         trial_sharpes = [per_period_sharpe(excess_panel[col]) for col in excess_panel.columns]
@@ -683,7 +701,7 @@ def main() -> None:
             else np.nan,
             axis=1,
         )
-        control.to_csv(out_dir / "vol_managed_control.csv", index=False)
+        _write_table(control, out_dir, "vol_managed_control.csv")
         LOGGER.info("Part 3 control:\n%s", control.to_string(index=False))
 
     LOGGER.info("Done in %.1f s.", time.perf_counter() - started)

@@ -1,0 +1,2 @@
+threshold_bps,n_comparable_days,n_legacy_only_days,n_v2_only_days,n_altered_days,pct_altered,mean_abs_diff_bps_altered,median_abs_diff_bps_altered,max_abs_diff_bps,n_tickers_compared
+1.0,5469005,10865,0,321,0.005869440602083925,713.4563714348598,120.7432824000003,20000.003999999997,1148

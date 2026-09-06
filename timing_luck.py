@@ -12,7 +12,11 @@ Luck of Smart Beta" (SSRN 3673910, 2020), measures it above 100 bps annualised
 for long-only factor indices.
 
 This module enumerates the 27 schedules the brief asks for (1 daily + 5 weekly
-+ 21 monthly) and runs the SMA sweep against every one of them.
++ 21 monthly) and runs the SMA sweep against every one of them. It also carries
+``HEADLINE_SCHEDULE``, the semi-monthly rule ``main.py`` reports, which is not
+one of the 27: semi-monthly fires twice a month, so it is a frequency the anchor
+sweep does not contain. It rides alongside as a labelled reference row and is
+excluded from the dispersion statistics.
 
 Anchor convention. Both the weekly and the monthly anchors are **trading-day
 ordinals**, not calendar weekdays or calendar days: weekly variant *k* rebalances
@@ -37,6 +41,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from preprocessing import build_rebalance_calendar
+
 LOGGER = logging.getLogger(__name__)
 
 WEEKLY_ANCHORS = (1, 2, 3, 4, 5)
@@ -47,15 +53,17 @@ MONTHLY_ANCHORS = tuple(range(1, 22))
 class EvaluationSchedule:
     """One signal-evaluation schedule: a frequency plus an anchor inside it."""
 
-    frequency: str  # 'daily' | 'weekly' | 'monthly'
+    frequency: str  # 'daily' | 'weekly' | 'monthly' | 'semi_monthly'
     anchor: int | None = None
 
     def __post_init__(self) -> None:
-        if self.frequency not in {"daily", "weekly", "monthly"}:
-            raise ValueError("frequency must be 'daily', 'weekly' or 'monthly'.")
-        if self.frequency == "daily":
+        if self.frequency not in {"daily", "weekly", "monthly", "semi_monthly"}:
+            raise ValueError(
+                "frequency must be 'daily', 'weekly', 'monthly' or 'semi_monthly'."
+            )
+        if self.frequency in {"daily", "semi_monthly"}:
             if self.anchor is not None:
-                raise ValueError("The daily schedule takes no anchor.")
+                raise ValueError(f"The {self.frequency} schedule takes no anchor.")
             return
         if self.anchor is None:
             raise ValueError(f"The {self.frequency} schedule requires an anchor.")
@@ -66,9 +74,21 @@ class EvaluationSchedule:
     @property
     def label(self) -> str:
         """Stable short name used as a column key and a plot tick."""
-        if self.frequency == "daily":
-            return "daily"
+        if self.anchor is None:
+            return self.frequency
         return f"{self.frequency}_{int(self.anchor):02d}"
+
+    @property
+    def is_anchor_variant(self) -> bool:
+        """Whether this schedule is one of the 27 the dispersion is measured over."""
+        return self.frequency in {"daily", "weekly", "monthly"}
+
+
+#: The schedule the README's headline runs on. It is deliberately *not* in
+#: ``enumerate_schedules``: semi-monthly fires twice a month, so it is a
+#: frequency the anchor sweep does not contain rather than a 28th anchor. It is
+#: carried alongside the 27 so the headline can be located among them.
+HEADLINE_SCHEDULE = EvaluationSchedule("semi_monthly")
 
 
 def enumerate_schedules() -> list[EvaluationSchedule]:
@@ -111,6 +131,11 @@ def build_evaluation_calendar(
     if schedule.frequency == "daily":
         return idx[1:]
 
+    if schedule.frequency == "semi_monthly":
+        # Delegate to the builder main.py already uses, so the headline row this
+        # produces is the headline, not a reimplementation of it.
+        return build_rebalance_calendar(idx, "semi_monthly")
+
     keys = _period_keys(idx, schedule.frequency)
     anchor = int(schedule.anchor)
 
@@ -141,6 +166,10 @@ def schedule_diagnostics(index: pd.DatetimeIndex, schedule: EvaluationSchedule) 
     if schedule.frequency == "daily":
         n_short = 0
         n_periods = len(idx) - 1
+    elif schedule.frequency == "semi_monthly":
+        # Two anchors a month, so a period is half a month and none are short.
+        n_short = 0
+        n_periods = int(len(pd.Series(_period_keys(idx, "monthly")).unique()) * 2)
     else:
         keys = _period_keys(idx, schedule.frequency)
         period_lengths = pd.Series(keys).groupby(keys).size()
@@ -162,15 +191,27 @@ def timing_luck_summary(
 ) -> pd.DataFrame:
     """Summarise dispersion across evaluation days, per SMA length.
 
+    Dispersion is measured over the 27 anchor variants only. Rows flagged as
+    non-anchor (the semi-monthly headline schedule) are carried through as
+    reference points but excluded from the range and standard deviation, so
+    adding the headline to the panel cannot move the dispersion it is being
+    compared against.
+
+    Two scalings of the range are reported. Against the daily rule's gap to the
+    index, which is the sweep's own reference point; and against the headline
+    schedule's gap to the index, which is the error bar that applies to the
+    number a reader actually sees first.
+
     Args:
-        variants: One row per (length, schedule) with ``cagr``, ``sharpe`` and a
-            ``label`` column; the daily variant must be labelled ``daily``.
-        index_cagr: Buy-and-hold CAGR of the benchmark, used to scale the range.
+        variants: One row per (rule, schedule) with ``cagr``, ``sharpe`` and a
+            ``label`` column; the daily variant must be labelled ``daily``. An
+            optional ``is_anchor_variant`` column marks the 27.
+        index_cagr: Buy-and-hold CAGR of the benchmark, used to scale the ranges.
         group_col: Column identifying the rule whose variants are compared.
 
     Returns:
         One row per rule with the range and standard deviation of CAGR and
-        Sharpe, and the CAGR range as a fraction of the daily-rule-to-index gap.
+        Sharpe, and the CAGR range as a fraction of each of the two gaps.
     """
     required = {group_col, "label", "cagr", "sharpe"}
     missing = required - set(variants.columns)
@@ -179,22 +220,44 @@ def timing_luck_summary(
 
     rows: list[dict[str, float]] = []
     for key, grp in variants.groupby(group_col, sort=True):
-        cagr = grp["cagr"].astype(float)
-        sharpe = grp["sharpe"].astype(float)
-        daily_rows = grp.loc[grp["label"] == "daily", "cagr"]
-        daily_cagr = float(daily_rows.iloc[0]) if len(daily_rows) else np.nan
+        if "is_anchor_variant" in grp.columns:
+            anchors = grp.loc[grp["is_anchor_variant"].astype(bool)]
+        else:
+            anchors = grp
 
-        # The gap the dispersion is measured against: how far the daily rule
-        # sits below simply holding the index. A range that is a large fraction
-        # of this gap means the reported shortfall is mostly calendar choice.
-        gap = float(index_cagr) - daily_cagr
+        cagr = anchors["cagr"].astype(float)
+        sharpe = anchors["sharpe"].astype(float)
+
+        def _first(label: str) -> float:
+            hit = grp.loc[grp["label"] == label, "cagr"]
+            return float(hit.iloc[0]) if len(hit) else np.nan
+
+        daily_cagr = _first("daily")
+        headline_cagr = _first(HEADLINE_SCHEDULE.label)
+
+        # The gaps the dispersion is measured against: how far each reference
+        # schedule sits below simply holding the index. A range that is a large
+        # fraction of a gap means that reported shortfall is mostly calendar.
+        daily_gap = float(index_cagr) - daily_cagr
+        headline_gap = float(index_cagr) - headline_cagr
         cagr_range = float(cagr.max() - cagr.min())
+
+        def _ratio(gap: float) -> float:
+            return cagr_range / gap if np.isfinite(gap) and gap != 0.0 else np.nan
+
+        # Rank of the headline among the anchors, worst to best.
+        if np.isfinite(headline_cagr) and len(cagr):
+            headline_rank = int((cagr < headline_cagr).sum()) + 1
+        else:
+            headline_rank = -1
 
         rows.append(
             {
                 group_col: key,
-                "n_variants": int(len(grp)),
+                "n_variants": int(len(anchors)),
                 "cagr_daily": daily_cagr,
+                "cagr_headline": headline_cagr,
+                "headline_rank_among_anchors": headline_rank,
                 "cagr_min": float(cagr.min()),
                 "cagr_max": float(cagr.max()),
                 "cagr_range": cagr_range,
@@ -203,8 +266,10 @@ def timing_luck_summary(
                 "sharpe_max": float(sharpe.max()),
                 "sharpe_range": float(sharpe.max() - sharpe.min()),
                 "sharpe_std": float(sharpe.std(ddof=1)),
-                "gap_daily_to_index": gap,
-                "range_over_gap": cagr_range / gap if np.isfinite(gap) and gap != 0.0 else np.nan,
+                "gap_daily_to_index": daily_gap,
+                "range_over_daily_gap": _ratio(daily_gap),
+                "gap_headline_to_index": headline_gap,
+                "range_over_headline_gap": _ratio(headline_gap),
             }
         )
 

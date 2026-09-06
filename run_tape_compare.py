@@ -43,6 +43,19 @@ from preprocessing import build_rebalance_calendar
 
 LOGGER = logging.getLogger(__name__)
 
+#: Tracked copy of the summary tables; see run_timing_luck.REPORTS_DIR. Only
+#: portfolio-level aggregates and difference counts go here. The per-ticker-day
+#: table of largest disagreements deliberately does not: it carries raw CRSP
+#: return values and stays in the gitignored output/ directory.
+REPORTS_DIR = Path("reports")
+
+
+def _write_table(frame: pd.DataFrame, out_dir: Path, name: str) -> None:
+    """Write one derived table to output/ and to the tracked reports/ copy."""
+    frame.to_csv(out_dir / name, index=False)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(REPORTS_DIR / name, index=False)
+
 
 def _setup_logging(output_dir: str) -> None:
     out = Path(output_dir)
@@ -180,7 +193,7 @@ def main() -> None:
         threshold_bps=float(args.threshold_bps),
     )
     LOGGER.info("Excluding each security's final day: %s", diff_ex_final)
-    pd.DataFrame([diff_ex_final]).to_csv(out_dir / "tape_return_differences_ex_final_day.csv", index=False)
+    _write_table(pd.DataFrame([diff_ex_final]), out_dir, "tape_return_differences_ex_final_day.csv")
 
     worst = largest_return_differences(
         legacy.close_returns, v2.close_returns,
@@ -200,8 +213,8 @@ def main() -> None:
     summary = pd.DataFrame(
         [{k: v for k, v in row.items() if k != "returns"} for row in (legacy_head, v2_head)]
     )
-    summary.to_csv(out_dir / "tape_comparison.csv", index=False)
-    pd.DataFrame([diff]).to_csv(out_dir / "tape_return_differences.csv", index=False)
+    _write_table(summary, out_dir, "tape_comparison.csv")
+    _write_table(pd.DataFrame([diff]), out_dir, "tape_return_differences.csv")
 
     LOGGER.info("Headline on both tapes:\n%s", summary.to_string(index=False))
     LOGGER.info("Done in %.1f s.", time.perf_counter() - started)
