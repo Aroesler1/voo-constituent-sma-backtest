@@ -8,6 +8,14 @@ below recomputes existing aggregates from committed data without credentials.
 
 Repository: `https://github.com/Aroesler1/voo-constituent-sma-backtest`
 
+**Latest corrected result:** on the pinned 1996-2024 comparison, strategy CAGR
+is **8.280% on legacy CRSP and 8.298% on CIZ**, against index CAGR of 9.977%
+and 10.039%, respectively. The earlier 8.40% result below is retained as
+history, not the current corrected headline. The [tape comparison](#which-crsp-tape)
+and [committed daily-return verifier](#offline-corrected-headline-verification)
+show the source and arithmetic. The corrected volatility-managed control also
+fails to improve net held-out Sharpe.
+
 ## What it does
 
 - **Point-in-time universe construction** from CRSP, with S&P membership
@@ -20,9 +28,9 @@ Repository: `https://github.com/Aroesler1/voo-constituent-sma-backtest`
 
 That last item is what this repository is currently most useful for. The strategy is a 200-day SMA, deliberately simple. The infrastructure around it is the substance, and running the audit against it produced the finding below.
 
-## Regenerated results (2026-09): the strategy loses to the index
+## Earlier results, preserved before the terminal-return repair
 
-Rerun after the data-integrity audit below, on 1,133 CRSP-resolved constituents, 7,300 trading days, 21,836 trades. Every table in this section is on the legacy `crsp.dsf` tape with `config.END_DATE` pinned to 2024-12-31.
+This historical rerun followed the initial data-integrity audit, before the later terminal-return correction. It used 1,133 CRSP-resolved constituents, 7,300 trading days and 21,836 trades. The tables in this section preserve that earlier legacy `crsp.dsf` run with `config.END_DATE` pinned to 2024-12-31; the corrected comparison is linked above.
 
 | metric | Strategy | S&P 500 total return |
 |---|---|---|
