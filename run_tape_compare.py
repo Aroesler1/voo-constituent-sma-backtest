@@ -6,12 +6,12 @@ legacy tape; only Format 2.0 (CIZ) is updated now. Schwarz, Walter & Weiss
 and note that the daily returns "did not change materially", which is what makes
 a daily-frequency strategy a clean test rather than a redundant one.
 
-This script rebuilds the panel from ``crsp.dsf_v2``, reruns the headline
-configuration on both tapes, counts the constituent-days whose return differs by
-more than a basis point, and writes the comparison to ``output/``.
+This script rebuilds both panels through the pinned 2024-12-31 endpoint, first
+writes identifier-matched coverage and ordinary/terminal-session differences,
+then reruns the same headline configuration on both tapes.
 
-The v2 pull is large. It caches per ticker under ``data_cache/crsp_v2/`` and is
-resumable: rerunning after an interruption fetches only what is missing.
+The v2 pull is large. New extracts use versioned caches. The frozen unversioned
+cache remains a read-only fallback.
 
     python run_tape_compare.py
 
@@ -36,6 +36,7 @@ from crsp_v2 import (
     fetch_benchmark_series_v2,
     fetch_constituent_prices_v2,
     largest_return_differences,
+    load_verified_terminal_outcomes,
 )
 from metrics import compute_metrics
 from panel import BacktestPanel, build_panel
@@ -48,13 +49,38 @@ LOGGER = logging.getLogger(__name__)
 #: table of largest disagreements deliberately does not: it carries raw CRSP
 #: return values and stays in the gitignored output/ directory.
 REPORTS_DIR = Path("reports")
+CORRECTED_REPORT_NAMES = {
+    "tape_comparison.csv": "tape_comparison_corrected.csv",
+    "tape_coverage.csv": "tape_coverage_corrected.csv",
+    "tape_return_differences.csv": "tape_return_differences_corrected.csv",
+    "tape_return_differences_by_session.csv": (
+        "tape_return_differences_by_session_corrected.csv"
+    ),
+}
 
 
 def _write_table(frame: pd.DataFrame, out_dir: Path, name: str) -> None:
     """Write one derived table to output/ and to the tracked reports/ copy."""
     frame.to_csv(out_dir / name, index=False)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(REPORTS_DIR / name, index=False)
+    frame.to_csv(REPORTS_DIR / CORRECTED_REPORT_NAMES.get(name, name), index=False)
+
+
+def _terminal_mask_from_outcomes(
+    permnos: pd.DataFrame,
+    outcomes: pd.DataFrame,
+    date_column: str,
+) -> pd.DataFrame:
+    """Map vendor terminal dates to ticker cells by permanent identifier."""
+    mask = pd.DataFrame(False, index=permnos.index, columns=permnos.columns)
+    if date_column not in outcomes.columns:
+        return mask
+    events = outcomes.dropna(subset=[date_column, "permno"]).copy()
+    events[date_column] = pd.to_datetime(events[date_column])
+    events = events[events[date_column].isin(mask.index)]
+    for date, group in events.groupby(date_column):
+        mask.loc[date] = permnos.loc[date].isin(group["permno"]).to_numpy()
+    return mask
 
 
 def _setup_logging(output_dir: str) -> None:
@@ -144,20 +170,32 @@ def main() -> None:
     config = load_config()
     _setup_logging(config.OUTPUT_DIR)
     out_dir = Path(config.OUTPUT_DIR)
+    if config.END_DATE != "2024-12-31":
+        raise ValueError("Tape comparison requires the pinned END_DATE=2024-12-31.")
+    if not config.CIZ_TERMINAL_RETURNS_PATH or not config.CIZ_TERMINAL_METADATA_PATH:
+        raise ValueError(
+            "Tape comparison requires a verified CIZ terminal-return extract and sidecar."
+        )
+    terminal_outcomes, terminal_metadata = load_verified_terminal_outcomes(
+        config.CIZ_TERMINAL_RETURNS_PATH,
+        config.CIZ_TERMINAL_METADATA_PATH,
+    )
+    LOGGER.info(
+        "Verified CIZ terminal source: product=%s table=%s semantics=%s",
+        terminal_metadata["source_product"],
+        terminal_metadata["source_table"],
+        terminal_metadata["return_semantics"],
+    )
 
     LOGGER.info("Building legacy (crsp.dsf) panel.")
     legacy = build_panel(config)
-    legacy_head = run_headline(legacy, config, "legacy_dsf")
-    LOGGER.info("Legacy headline CAGR=%.4f Sharpe=%.4f", legacy_head["strategy_cagr"], legacy_head["strategy_sharpe"])
 
-    LOGGER.info("Building v2 (crsp.dsf_v2) panel; the first run pulls the whole universe.")
+    LOGGER.info("Building v2 panel from versioned or frozen CIZ caches.")
     v2 = build_panel(
         config,
         constituent_fetcher=fetch_constituent_prices_v2,
         benchmark_fetcher=fetch_benchmark_series_v2,
     )
-    v2_head = run_headline(v2, config, "v2_dsf_v2")
-    LOGGER.info("v2 headline CAGR=%.4f Sharpe=%.4f", v2_head["strategy_cagr"], v2_head["strategy_sharpe"])
 
     # build_panel fills uncovered constituent-days with a zero return rather
     # than NaN, so validity has to come from the price matrix. Without this the
@@ -171,36 +209,101 @@ def main() -> None:
         v2.close_returns,
         legacy_valid=legacy_valid,
         v2_valid=v2_valid,
+        legacy_permno=legacy.permno_df,
+        v2_permno=v2.permno_df,
         threshold_bps=float(args.threshold_bps),
     )
-    LOGGER.info("Constituent-day return differences: %s", diff)
-
-    # Split off each security's final covered day. The legacy tape compounds its
-    # delisting return into that row and CIZ's DlyRet does not, so those rows
-    # measure a schema gap in this loader rather than a difference in the tape's
-    # numbers. Reporting both makes the size of each visible.
-    final_day = legacy_valid.apply(lambda col: col[::-1].idxmax() if col.any() else pd.NaT)
-    is_final = pd.DataFrame(False, index=legacy_valid.index, columns=legacy_valid.columns)
-    for ticker, day in final_day.items():
-        if pd.notna(day):
-            is_final.loc[day, ticker] = True
-
-    diff_ex_final = compare_return_panels(
-        legacy.close_returns,
-        v2.close_returns,
-        legacy_valid=legacy_valid & ~is_final,
-        v2_valid=v2_valid & ~is_final,
-        threshold_bps=float(args.threshold_bps),
+    legacy_terminal = (
+        legacy.terminal_mask.reindex_like(legacy_valid).fillna(False)
+        | _terminal_mask_from_outcomes(
+            legacy.permno_df,
+            terminal_outcomes,
+            "legacy_event_date",
+        )
     )
-    LOGGER.info("Excluding each security's final day: %s", diff_ex_final)
-    _write_table(pd.DataFrame([diff_ex_final]), out_dir, "tape_return_differences_ex_final_day.csv")
+    v2_terminal = (
+        v2.terminal_mask.reindex_like(v2_valid).fillna(False)
+        | _terminal_mask_from_outcomes(
+            v2.permno_df,
+            terminal_outcomes,
+            "event_date",
+        )
+    )
+    terminal = legacy_terminal | v2_terminal
+    segmented_diffs = []
+    for segment, mask in (
+        ("ordinary_session", ~terminal),
+        ("terminal_session", terminal),
+    ):
+        row = compare_return_panels(
+            legacy.close_returns,
+            v2.close_returns,
+            legacy_valid=legacy_valid & mask,
+            v2_valid=v2_valid & mask,
+            legacy_permno=legacy.permno_df,
+            v2_permno=v2.permno_df,
+            threshold_bps=float(args.threshold_bps),
+        )
+        row["segment"] = segment
+        segmented_diffs.append(row)
+
+    coverage = pd.DataFrame(
+        [
+            {
+                "tape": name,
+                "n_tickers": len(panel.valid_cols),
+                "n_covered_constituent_days": int(valid.to_numpy().sum()),
+                "n_terminal_sessions": int(terminal_mask.to_numpy().sum()),
+                "n_terminal_returns_applied": int(
+                    panel.terminal_applied_mask.to_numpy().sum()
+                ),
+                "first_date": panel.trading_index.min().date().isoformat(),
+                "last_date": panel.trading_index.max().date().isoformat(),
+            }
+            for name, panel, valid, terminal_mask in (
+                ("legacy_dsf", legacy, legacy_valid, legacy_terminal),
+                ("v2_ciz", v2, v2_valid, v2_terminal),
+            )
+        ]
+    )
+    _write_table(coverage, out_dir, "tape_coverage.csv")
+    _write_table(
+        pd.DataFrame(segmented_diffs),
+        out_dir,
+        "tape_return_differences_by_session.csv",
+    )
+    _write_table(pd.DataFrame([diff]), out_dir, "tape_return_differences.csv")
+    LOGGER.info("Coverage:\n%s", coverage.to_string(index=False))
+    LOGGER.info(
+        "Ordinary and terminal-session differences:\n%s",
+        pd.DataFrame(segmented_diffs).to_string(index=False),
+    )
 
     worst = largest_return_differences(
         legacy.close_returns, v2.close_returns,
-        legacy_valid=legacy_valid, v2_valid=v2_valid, top_n=25,
+        legacy_valid=legacy_valid,
+        v2_valid=v2_valid,
+        legacy_permno=legacy.permno_df,
+        v2_permno=v2.permno_df,
+        top_n=25,
     )
     worst.to_csv(out_dir / "tape_largest_differences.csv", index=False)
     LOGGER.info("Largest tape disagreements:\n%s", worst.head(10).to_string(index=False))
+
+    # Coverage and return-difference evidence is now durable. Only then run and
+    # report strategy metrics with identical membership, costs, and endpoint.
+    legacy_head = run_headline(legacy, config, "legacy_dsf")
+    v2_head = run_headline(v2, config, "v2_ciz")
+    LOGGER.info(
+        "Legacy headline CAGR=%.4f Sharpe=%.4f",
+        legacy_head["strategy_cagr"],
+        legacy_head["strategy_sharpe"],
+    )
+    LOGGER.info(
+        "v2 headline CAGR=%.4f Sharpe=%.4f",
+        v2_head["strategy_cagr"],
+        v2_head["strategy_sharpe"],
+    )
 
     # Strategy-level agreement: the two daily return series on identical dates.
     common = legacy_head["returns"].index.intersection(v2_head["returns"].index)
@@ -209,12 +312,14 @@ def main() -> None:
     diff["strategy_days_over_threshold"] = int((strat_gap_bps > float(args.threshold_bps)).sum())
     diff["strategy_mean_abs_gap_bps"] = float(strat_gap_bps.mean())
     diff["strategy_max_abs_gap_bps"] = float(strat_gap_bps.max()) if len(common) else np.nan
+    # The constituent-only evidence was persisted before either strategy ran.
+    # Refresh this one aggregate report now that strategy-level gaps are known.
+    _write_table(pd.DataFrame([diff]), out_dir, "tape_return_differences.csv")
 
     summary = pd.DataFrame(
         [{k: v for k, v in row.items() if k != "returns"} for row in (legacy_head, v2_head)]
     )
     _write_table(summary, out_dir, "tape_comparison.csv")
-    _write_table(pd.DataFrame([diff]), out_dir, "tape_return_differences.csv")
 
     LOGGER.info("Headline on both tapes:\n%s", summary.to_string(index=False))
     LOGGER.info("Done in %.1f s.", time.perf_counter() - started)
