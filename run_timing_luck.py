@@ -35,7 +35,6 @@ from backtest_engine import run_buy_and_hold, run_constituent_backtest
 from config import BacktestConfig, load_config
 from metrics import compute_metrics
 from panel import BacktestPanel, build_panel, extract_adjusted_series
-from reporting import plot_timing_luck_box
 from report_evidence import (
     CONTROL_DAILY_NAME,
     CONTROL_MANIFEST_NAME,
@@ -691,6 +690,8 @@ def main() -> None:
         _write_table(variants, out_dir, "timing_luck_variants.csv")
         summary = timing_luck_summary(variants, index_cagr=index_cagr)
         _write_table(summary, out_dir, "timing_luck_summary.csv")
+        from reporting import plot_timing_luck_box
+
         plot_timing_luck_box(variants, index_cagr, config.OUTPUT_DIR)
         # output/ is gitignored, so the README's copy goes somewhere tracked.
         plot_timing_luck_box(variants, index_cagr, "figures")
