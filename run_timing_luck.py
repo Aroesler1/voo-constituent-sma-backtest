@@ -36,6 +36,13 @@ from config import BacktestConfig, load_config
 from metrics import compute_metrics
 from panel import BacktestPanel, build_panel, extract_adjusted_series
 from reporting import plot_timing_luck_box
+from report_evidence import (
+    CONTROL_DAILY_NAME,
+    CONTROL_MANIFEST_NAME,
+    committed_report_path,
+    write_daily_evidence,
+    write_manifest,
+)
 from spread_edge import edge_spread_series
 from statistics_mt import deflated_sharpe, per_period_sharpe, romano_wolf_stepdown
 from strategy import compute_sma_matrix, generate_active_mask
@@ -493,7 +500,7 @@ def run_vol_managed_control(
     panel: BacktestPanel,
     config: BacktestConfig,
     legs: dict[str, dict[str, Any]],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Run the volatility-managed overlay on each supplied return series.
 
     Each leg is run at both weight-update frequencies, gross and net of the
@@ -509,7 +516,8 @@ def run_vol_managed_control(
 
     Returns:
         A metrics table and the panel of net-overlay-minus-benchmark daily
-        returns used for the Romano-Wolf test.
+        returns used for the Romano-Wolf test, followed by the aggregate daily
+        return series needed to reproduce every performance metric.
     """
     dates = pd.DatetimeIndex(panel.trading_index)
     train_end = dates[len(dates) // 2]
@@ -531,6 +539,9 @@ def run_vol_managed_control(
 
     rows: list[dict[str, Any]] = []
     excess: dict[str, pd.Series] = {}
+    daily: dict[str, pd.Series] = {
+        "cash_return": cash_daily.loc[evaluation_dates].rename("cash_return")
+    }
 
     def _row(**kwargs: Any) -> dict[str, Any]:
         rets = kwargs["rets"].reindex(evaluation_dates)
@@ -566,6 +577,7 @@ def run_vol_managed_control(
     for name, spec in legs.items():
         base = spec["returns"].reindex(dates).astype(float).fillna(0.0)
         c = calibrate_c(base, train_end=train_end, window=DEFAULT_WINDOW)
+        daily[f"{name}__buy_and_hold_return"] = base.loc[evaluation_dates]
 
         rows.append(
             _row(
@@ -616,6 +628,9 @@ def run_vol_managed_control(
                     **shared,
                 )
             )
+            daily[f"{name}__vol_managed_{update}_gross_return"] = managed[
+                "gross_returns"
+            ].loc[evaluation_dates]
             rows.append(
                 _row(
                     variant=f"vol_managed_{update}_net",
@@ -624,12 +639,19 @@ def run_vol_managed_control(
                     **shared,
                 )
             )
+            daily[f"{name}__vol_managed_{update}_net_return"] = managed[
+                "returns"
+            ].loc[evaluation_dates]
             excess[f"{name}__{update}"] = (
                 managed["returns"].loc[evaluation_dates]
                 - base.loc[evaluation_dates]
             ).rename(f"{name}__{update}")
 
-    return pd.DataFrame(rows), pd.concat(excess.values(), axis=1)
+    return (
+        pd.DataFrame(rows),
+        pd.concat(excess.values(), axis=1),
+        pd.DataFrame(daily, index=evaluation_dates),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -722,7 +744,7 @@ def main() -> None:
             },
         }
 
-        control, excess_panel = run_vol_managed_control(panel, config, legs)
+        control, excess_panel, daily = run_vol_managed_control(panel, config, legs)
 
         # Same multiple-testing treatment as the SMA sweep: Romano-Wolf over the
         # family of overlays against their own buy-and-hold, then a Deflated
@@ -742,6 +764,59 @@ def main() -> None:
             if r["variant"].endswith("_net")
             else np.nan,
             axis=1,
+        )
+        daily.index.name = "date"
+        daily = daily.reset_index()
+        daily["date"] = pd.to_datetime(daily["date"]).dt.strftime("%Y-%m-%d")
+        artifact = write_daily_evidence(
+            daily,
+            output_dir=out_dir,
+            report_dir=REPORTS_DIR,
+            name=CONTROL_DAILY_NAME,
+        )
+        source_labels = {
+            "cash_return": {
+                "source_label": "cash_sleeve:elapsed_calendar_day_return",
+                "leg": "cash",
+                "variant": "cash_return",
+            }
+        }
+        for row in control.to_dict(orient="records"):
+            column = f"{row['leg']}__{row['variant']}_return"
+            source_labels[column] = {
+                "source_label": f"{row['leg']}:{row['variant']}",
+                "leg": row["leg"],
+                "variant": row["variant"],
+                "description": row["description"],
+            }
+        write_manifest(
+            {
+                **artifact,
+                "schema_version": 1,
+                "content": "portfolio-level daily simple returns only",
+                "date_column": "date",
+                "cash_return_column": "cash_return",
+                "return_columns": source_labels,
+                "metric_policy": {
+                    "periods_per_year": 252.0,
+                    "geometric_sharpe_cash_rate_annual": (
+                        panel.effective_cash_rate
+                    ),
+                    "arithmetic_sharpe_cash_return_column": "cash_return",
+                },
+            },
+            output_dir=out_dir,
+            report_dir=REPORTS_DIR,
+            name=CONTROL_MANIFEST_NAME,
+        )
+        control["daily_returns_path"] = committed_report_path(CONTROL_DAILY_NAME)
+        control["daily_return_column"] = control.apply(
+            lambda r: f"{r['leg']}__{r['variant']}_return",
+            axis=1,
+        )
+        control["cash_return_column"] = "cash_return"
+        control["daily_returns_manifest_path"] = committed_report_path(
+            CONTROL_MANIFEST_NAME
         )
         _write_table(control, out_dir, "vol_managed_control.csv")
         LOGGER.info("Part 3 control:\n%s", control.to_string(index=False))

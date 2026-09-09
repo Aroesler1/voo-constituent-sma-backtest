@@ -48,6 +48,14 @@ source fields, return semantics, row counts, and external extract hash. The
 largest-return-differences table stays under gitignored `output/` because it
 contains licensed ticker-day observations.
 
+Corrected headline CSVs are verified from committed portfolio-level daily
+returns in `reports/tape_headline_daily_returns.csv.gz` and
+`reports/vol_managed_control_daily_returns.csv.gz`. Those files contain dated
+strategy and benchmark series only, with SHA-256 manifests and no tickers or
+PERMNOs. `python verify_corrected_reports.py` recomputes CAGR, volatility,
+Sharpe, drawdown, and tape-gap fields from those series rather than comparing
+report bytes to local output copies.
+
 With a WRDS entitlement:
 
 ```bash
