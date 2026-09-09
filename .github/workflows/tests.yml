@@ -30,3 +30,6 @@ jobs:
       # a secret was configured.
       - name: Run tests
         run: python -m pytest tests -q
+
+      - name: Verify committed schedule tables
+        run: python run_schedule_audit.py --check

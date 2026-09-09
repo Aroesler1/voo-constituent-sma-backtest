@@ -1,0 +1,2 @@
+source_product,daily_source_table,terminal_source_table,terminal_event_date_field,terminal_return_field,return_semantics,n_terminal_rows,n_available_terminal_returns,n_missing_terminal_returns,terminal_extract_sha256
+CRSP US Stock Database Flat File Format 2.0 (CIZ),crsp.dsf_v2,crsp.stkdelists,DelDlyDt,DelRet,included_in_dlyret,18966,17949,1017,7fe0edc5a6326be7ca98e3a97c8fa2e96aeef42d21d87a4dd657129e6d886350

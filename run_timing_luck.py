@@ -47,7 +47,13 @@ from timing_luck import (
     schedule_diagnostics,
     timing_luck_summary,
 )
-from vol_managed import DEFAULT_CAP, DEFAULT_WINDOW, apply_vol_management, calibrate_c
+from vol_managed import (
+    DEFAULT_CAP,
+    DEFAULT_WINDOW,
+    apply_vol_management,
+    calibrate_c,
+    cash_returns_from_annual_yield,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,13 +67,20 @@ REFERENCE_SCHEDULE = EvaluationSchedule("daily")
 #: here and committed. These are portfolio-level aggregates only: no CRSP row
 #: and nothing from data_cache/ is ever written to this directory.
 REPORTS_DIR = Path("reports")
+CORRECTED_REPORT_NAMES = {
+    "vol_managed_control.csv": "vol_managed_control_corrected.csv",
+    "vol_managed_romano_wolf.csv": "vol_managed_romano_wolf_corrected.csv",
+}
 
 
 def _write_table(frame: pd.DataFrame, out_dir: Path, name: str, index: bool = False) -> None:
     """Write one derived table to output/ and to the tracked reports/ copy."""
     frame.to_csv(out_dir / name, index=index)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(REPORTS_DIR / name, index=index)
+    frame.to_csv(
+        REPORTS_DIR / CORRECTED_REPORT_NAMES.get(name, name),
+        index=index,
+    )
 
 
 def _setup_logging(output_dir: str) -> None:
@@ -500,32 +513,48 @@ def run_vol_managed_control(
     """
     dates = pd.DatetimeIndex(panel.trading_index)
     train_end = dates[len(dates) // 2]
+    evaluation_dates = dates[dates > train_end]
+    if evaluation_dates.empty:
+        raise ValueError("Volatility-control evaluation window is empty.")
     LOGGER.info("Vol-managed training half ends %s.", train_end.date())
 
     if panel.cash_curve is not None:
-        cash_daily = panel.cash_curve.reindex(dates).ffill().shift(1).fillna(config.CASH_RATE_ANNUAL) / 360.0
+        annual_cash = (
+            panel.cash_curve.reindex(dates)
+            .ffill()
+            .shift(1)
+            .fillna(config.CASH_RATE_ANNUAL)
+        )
     else:
-        cash_daily = pd.Series(config.CASH_RATE_ANNUAL / 360.0, index=dates)
+        annual_cash = pd.Series(config.CASH_RATE_ANNUAL, index=dates)
+    cash_daily = cash_returns_from_annual_yield(annual_cash)
 
     rows: list[dict[str, Any]] = []
     excess: dict[str, pd.Series] = {}
 
     def _row(**kwargs: Any) -> dict[str, Any]:
+        rets = kwargs["rets"].reindex(evaluation_dates)
+        equity = (1.0 + rets).cumprod() * float(config.INITIAL_CAPITAL)
         met = compute_metrics(
-            kwargs["equity"],
-            kwargs["rets"],
+            equity,
+            rets,
             pd.DataFrame(),
-            pd.Series(1, index=kwargs["equity"].index, dtype="Int64"),
+            pd.Series(1, index=equity.index, dtype="Int64"),
             panel.effective_cash_rate,
         )
         return {
             "leg": kwargs["leg"],
             "variant": kwargs["variant"],
             "description": kwargs["description"],
+            "train_start": dates.min().date().isoformat(),
+            "train_end": train_end.date().isoformat(),
+            "evaluation_start": evaluation_dates.min().date().isoformat(),
+            "evaluation_end": evaluation_dates.max().date().isoformat(),
+            "n_evaluation_days": len(evaluation_dates),
             "cagr": met["cagr"],
             "annualized_vol": met["annualized_vol"],
             "sharpe_geometric": met["sharpe"],
-            "sharpe_arithmetic": _annualized_arithmetic_sharpe(kwargs["rets"], cash_daily),
+            "sharpe_arithmetic": _annualized_arithmetic_sharpe(rets, cash_daily),
             "max_drawdown": met["max_drawdown"],
             "c": kwargs.get("c", np.nan),
             "avg_weight": kwargs.get("avg_weight", 1.0),
@@ -543,7 +572,6 @@ def run_vol_managed_control(
                 leg=name,
                 variant="buy_and_hold",
                 description=spec["description"],
-                equity=(1.0 + base).cumprod() * float(config.INITIAL_CAPITAL),
                 rets=base,
             )
         )
@@ -563,14 +591,26 @@ def run_vol_managed_control(
                 "leg": name,
                 "description": spec["description"],
                 "c": c,
-                "avg_weight": managed["avg_weight"],
-                "pct_time_levered": managed["pct_time_levered"],
-                "annual_turnover": managed["annual_turnover"],
+                "avg_weight": float(
+                    managed["weights"].loc[evaluation_dates].mean()
+                ),
+                "pct_time_levered": float(
+                    (managed["weights"].loc[evaluation_dates] > 1.0).mean()
+                ),
+                "annual_turnover": float(
+                    managed["turnover"].loc[evaluation_dates].sum()
+                    / (
+                        (
+                            evaluation_dates[-1] - evaluation_dates[0]
+                        ).days
+                        + 1
+                    )
+                    * 365.25
+                ),
             }
             rows.append(
                 _row(
                     variant=f"vol_managed_{update}_gross",
-                    equity=managed["gross_equity_curve"],
                     rets=managed["gross_returns"],
                     overlay_cost_bps=0.0,
                     **shared,
@@ -579,13 +619,15 @@ def run_vol_managed_control(
             rows.append(
                 _row(
                     variant=f"vol_managed_{update}_net",
-                    equity=managed["equity_curve"],
                     rets=managed["returns"],
                     overlay_cost_bps=float(spec["cost_bps"]),
                     **shared,
                 )
             )
-            excess[f"{name}__{update}"] = (managed["returns"] - base).rename(f"{name}__{update}")
+            excess[f"{name}__{update}"] = (
+                managed["returns"].loc[evaluation_dates]
+                - base.loc[evaluation_dates]
+            ).rename(f"{name}__{update}")
 
     return pd.DataFrame(rows), pd.concat(excess.values(), axis=1)
 
