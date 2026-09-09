@@ -228,6 +228,13 @@ The historical full-sample result said the index monthly net overlay raised geom
 
 Romano-Wolf testing over all six net overlays rejects none at 5% family-wise error. Every mean excess return is negative, adjusted p-values run from 0.940 to 1.000, and the result is recorded in `reports/vol_managed_romano_wolf_corrected.csv`. This is a failed positive-control hypothesis, not evidence that volatility management improves executable profit in this sample.
 
+The 15 held-out buy-and-hold, gross, and net daily portfolio series behind the
+control table are committed in
+`reports/vol_managed_control_daily_returns.csv.gz`, with source labels and
+metric conventions in its adjacent manifest. `python
+verify_corrected_reports.py` independently recomputes every corrected control
+CAGR, volatility, geometric and arithmetic Sharpe, and max drawdown.
+
 The SMA-200 leg remains a documented degeneracy. Its held-out average exposure is 0.0037 because near-cash training returns make inverse realised variance dominate the calibration. Inverse-variance scaling is not useful on a return series with long near-flat stretches.
 
 Cederburg, O'Doherty, Wang and Yan, ["On the performance of volatility-managed portfolios"](https://doi.org/10.1016/j.jfineco.2020.04.015) (*Journal of Financial Economics* 138(1), 2020, 95-117), find that the strategy does not survive real-time implementation for most factors. The corrected result is consistent with that caution.
@@ -426,7 +433,13 @@ Run the unit tests (no credentials required):
 
 ## Generated Outputs
 
-`output/` is gitignored and regenerating it needs a WRDS entitlement, so the small derived tables every number in this README is quoted from are committed to **`reports/`** as well. They are portfolio-level aggregates and difference counts only; no CRSP row and nothing under `data_cache/` is ever written there. `output/tape_largest_differences.csv` is the one table deliberately left out, because it carries raw CRSP returns per ticker-day.
+`output/` is gitignored and a cold regeneration needs a WRDS entitlement, so
+the derived tables and compact daily portfolio aggregates needed to verify the
+corrected headlines are committed to **`reports/`** as well. They contain dates,
+aggregate returns, source labels, and difference counts only; no ticker,
+PERMNO, constituent-level return, CRSP row, or cache file is committed.
+`output/tape_largest_differences.csv` is deliberately left out because it
+carries licensed ticker-day returns.
 
 ```text
 reports/
@@ -444,6 +457,11 @@ reports/
   tape_return_differences_by_session_corrected.csv
                                              ordinary versus terminal differences
   ciz_source_validation.csv                 source fields, semantics, and extract hash
+  tape_headline_daily_returns.csv.gz        legacy/CIZ strategy and benchmark daily returns
+  tape_headline_daily_returns.manifest.json source labels, metric policy, and SHA-256
+  vol_managed_control_daily_returns.csv.gz  15 held-out portfolio series plus cash returns
+  vol_managed_control_daily_returns.manifest.json
+                                             source labels, metric policy, and SHA-256
 ```
 
 Successful runs write artifacts to `output/`, including:
@@ -478,6 +496,48 @@ Successful runs write artifacts to `output/`, including:
   corrected tracked copies use the `_corrected.csv` suffix
 - `tape_largest_differences.csv` only in `output/`, because its rows are
   licensed observations
+
+### Offline corrected-headline verification
+
+The committed evidence is sufficient for a credential-free arithmetic check:
+
+```bash
+python verify_corrected_reports.py
+```
+
+This verifies the corrected tape and volatility-control CSVs directly from the
+committed gzip files, including tape strategy-gap counts and magnitudes. It
+also verifies each gzip SHA-256 against its manifest and rejects unexpected
+columns.
+
+To rebuild the evidence from an existing warm cache, run the two CPU-heavy jobs
+sequentially with the network gate closed:
+
+```bash
+BACKTEST_OFFLINE=1 BACKTEST_CACHE_DIR=/path/to/warm/data_cache \
+python run_timing_luck.py --parts 3
+```
+
+```bash
+BACKTEST_OFFLINE=1 BACKTEST_CACHE_DIR=/path/to/warm/data_cache \
+CIZ_TERMINAL_RETURNS_PATH=/path/to/verified/voo_ciz_terminal_returns.csv \
+CIZ_TERMINAL_METADATA_PATH=/path/to/verified/voo_ciz_terminal_returns.metadata.json \
+python run_tape_compare.py
+```
+
+```bash
+python finalize_corrected_reports.py \
+  --output-dir output \
+  --report-dir reports \
+  --ciz-metadata /path/to/verified/voo_ciz_terminal_returns.metadata.json
+python verify_corrected_reports.py
+```
+
+Leave `WRDS_DUO_READY` unset. `BACKTEST_OFFLINE=1` makes missing cache inputs a
+failure instead of a connection attempt. The committed daily evidence verifies
+performance arithmetic; it does not reproduce licensed constituent coverage,
+trade counts, turnover/cost attribution, or the Romano-Wolf and Deflated
+Sharpe calculations.
 
 ## Intended Use
 

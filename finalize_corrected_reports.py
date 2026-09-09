@@ -8,6 +8,14 @@ from pathlib import Path
 
 import pandas as pd
 
+from report_evidence import (
+    CONTROL_DAILY_NAME,
+    CONTROL_MANIFEST_NAME,
+    TAPE_DAILY_NAME,
+    TAPE_MANIFEST_NAME,
+)
+from verify_corrected_reports import verify_corrected_reports
+
 
 MAPPINGS = {
     "tape_comparison.csv": "tape_comparison_corrected.csv",
@@ -18,6 +26,10 @@ MAPPINGS = {
     ),
     "vol_managed_control.csv": "vol_managed_control_corrected.csv",
     "vol_managed_romano_wolf.csv": "vol_managed_romano_wolf_corrected.csv",
+    TAPE_DAILY_NAME: TAPE_DAILY_NAME,
+    TAPE_MANIFEST_NAME: TAPE_MANIFEST_NAME,
+    CONTROL_DAILY_NAME: CONTROL_DAILY_NAME,
+    CONTROL_MANIFEST_NAME: CONTROL_MANIFEST_NAME,
 }
 
 
@@ -84,6 +96,7 @@ def main() -> int:
         raise SystemExit(f"missing corrected inputs: {', '.join(missing)}")
     if stale:
         raise SystemExit(f"stale corrected reports: {', '.join(stale)}")
+    verify_corrected_reports(args.report_dir)
     return 0
 
 
