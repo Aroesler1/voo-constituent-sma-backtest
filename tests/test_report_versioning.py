@@ -46,3 +46,8 @@ def test_positive_control_writes_only_the_corrected_tracked_name(
 
     assert historical.read_text(encoding="utf-8") == "historical\n"
     assert pd.read_csv(reports / "vol_managed_control_corrected.csv").at[0, "value"] == 1
+
+
+def test_timing_luck_module_does_not_import_matplotlib():
+    """Test collection must not require matplotlib; plotting is a run-time import."""
+    assert "plot_timing_luck_box" not in run_timing_luck.__dict__
