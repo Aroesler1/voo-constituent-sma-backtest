@@ -35,6 +35,14 @@ class BacktestConfig:
     TICKERS: list[str] = field(default_factory=lambda: ["SPY", "VOO"])
     CACHE_DIR: str = "./data_cache"
     PRIMARY_PRICE_SOURCE: str = "crsp"
+    # Explicitly offline means cached and local inputs only. It is stronger than
+    # leaving WRDS_DUO_READY unset: unresolved tickers are returned as missing
+    # before any connection helper or vendor import can run.
+    OFFLINE_MODE: bool = False
+    # A verified terminal-outcome extract and its provenance sidecar are
+    # supplied after the approved metadata query. They remain outside Git.
+    CIZ_TERMINAL_RETURNS_PATH: str | None = None
+    CIZ_TERMINAL_METADATA_PATH: str | None = None
 
     # Strategy core
     STRATEGY_MODE: str = "constituent_sma"
@@ -199,7 +207,11 @@ class BacktestConfig:
             )
         if self.SNAPSHOT_LOCK_ID and not self.FREEZE_SNAPSHOTS:
             raise ValueError("SNAPSHOT_LOCK_ID requires FREEZE_SNAPSHOTS=True.")
-        if not self.has_crsp_credentials():
+        if bool(self.CIZ_TERMINAL_RETURNS_PATH) != bool(self.CIZ_TERMINAL_METADATA_PATH):
+            raise ValueError(
+                "CIZ_TERMINAL_RETURNS_PATH and CIZ_TERMINAL_METADATA_PATH must be set together."
+            )
+        if not self.OFFLINE_MODE and not self.has_crsp_credentials():
             raise ValueError("Provide CRSP/WRDS credentials; CRSP is the only price source.")
 
     def has_crsp_credentials(self) -> bool:
@@ -239,8 +251,15 @@ def get_periods() -> dict[str, tuple[str, str]]:
 
 def load_config() -> BacktestConfig:
     """Load runtime configuration from defaults and environment."""
+    offline_raw = os.getenv("BACKTEST_OFFLINE", "0").strip()
+    if offline_raw not in {"0", "1"}:
+        raise ValueError("BACKTEST_OFFLINE must be exactly '0' or '1'.")
     cfg = BacktestConfig(
         END_DATE=os.getenv("BACKTEST_END_DATE", BacktestConfig.END_DATE),
+        CACHE_DIR=os.getenv("BACKTEST_CACHE_DIR", BacktestConfig.CACHE_DIR),
+        OFFLINE_MODE=offline_raw == "1",
+        CIZ_TERMINAL_RETURNS_PATH=os.getenv("CIZ_TERMINAL_RETURNS_PATH"),
+        CIZ_TERMINAL_METADATA_PATH=os.getenv("CIZ_TERMINAL_METADATA_PATH"),
         CRSP_API_KEY=os.getenv("CRSP_API_KEY"),
         CRSP_USERNAME=os.getenv("CRSP_USERNAME"),
         WRDS_USERNAME=os.getenv("WRDS_USERNAME"),

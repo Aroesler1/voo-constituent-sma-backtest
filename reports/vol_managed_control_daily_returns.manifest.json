@@ -1,0 +1,114 @@
+{
+  "artifact_path": "reports/vol_managed_control_daily_returns.csv.gz",
+  "artifact_sha256": "84ac520cdef8db12d6b0ac77ff50846b8bbaa7dd99a09f754dc1f79bbdf9c6d7",
+  "cash_return_column": "cash_return",
+  "compressed_bytes": 437392,
+  "content": "portfolio-level daily simple returns only",
+  "date_column": "date",
+  "first_date": "2010-07-02",
+  "last_date": "2024-12-31",
+  "metric_policy": {
+    "arithmetic_sharpe_cash_return_column": "cash_return",
+    "geometric_sharpe_cash_rate_annual": 0.02,
+    "periods_per_year": 252.0
+  },
+  "return_columns": {
+    "cash_return": {
+      "leg": "cash",
+      "source_label": "cash_sleeve:elapsed_calendar_day_return",
+      "variant": "cash_return"
+    },
+    "constituents_equal_weight__buy_and_hold_return": {
+      "description": "Equal-weight point-in-time constituents",
+      "leg": "constituents_equal_weight",
+      "source_label": "constituents_equal_weight:buy_and_hold",
+      "variant": "buy_and_hold"
+    },
+    "constituents_equal_weight__vol_managed_daily_gross_return": {
+      "description": "Equal-weight point-in-time constituents",
+      "leg": "constituents_equal_weight",
+      "source_label": "constituents_equal_weight:vol_managed_daily_gross",
+      "variant": "vol_managed_daily_gross"
+    },
+    "constituents_equal_weight__vol_managed_daily_net_return": {
+      "description": "Equal-weight point-in-time constituents",
+      "leg": "constituents_equal_weight",
+      "source_label": "constituents_equal_weight:vol_managed_daily_net",
+      "variant": "vol_managed_daily_net"
+    },
+    "constituents_equal_weight__vol_managed_monthly_gross_return": {
+      "description": "Equal-weight point-in-time constituents",
+      "leg": "constituents_equal_weight",
+      "source_label": "constituents_equal_weight:vol_managed_monthly_gross",
+      "variant": "vol_managed_monthly_gross"
+    },
+    "constituents_equal_weight__vol_managed_monthly_net_return": {
+      "description": "Equal-weight point-in-time constituents",
+      "leg": "constituents_equal_weight",
+      "source_label": "constituents_equal_weight:vol_managed_monthly_net",
+      "variant": "vol_managed_monthly_net"
+    },
+    "constituents_sma200__buy_and_hold_return": {
+      "description": "Constituent SMA-200, daily evaluation",
+      "leg": "constituents_sma200",
+      "source_label": "constituents_sma200:buy_and_hold",
+      "variant": "buy_and_hold"
+    },
+    "constituents_sma200__vol_managed_daily_gross_return": {
+      "description": "Constituent SMA-200, daily evaluation",
+      "leg": "constituents_sma200",
+      "source_label": "constituents_sma200:vol_managed_daily_gross",
+      "variant": "vol_managed_daily_gross"
+    },
+    "constituents_sma200__vol_managed_daily_net_return": {
+      "description": "Constituent SMA-200, daily evaluation",
+      "leg": "constituents_sma200",
+      "source_label": "constituents_sma200:vol_managed_daily_net",
+      "variant": "vol_managed_daily_net"
+    },
+    "constituents_sma200__vol_managed_monthly_gross_return": {
+      "description": "Constituent SMA-200, daily evaluation",
+      "leg": "constituents_sma200",
+      "source_label": "constituents_sma200:vol_managed_monthly_gross",
+      "variant": "vol_managed_monthly_gross"
+    },
+    "constituents_sma200__vol_managed_monthly_net_return": {
+      "description": "Constituent SMA-200, daily evaluation",
+      "leg": "constituents_sma200",
+      "source_label": "constituents_sma200:vol_managed_monthly_net",
+      "variant": "vol_managed_monthly_net"
+    },
+    "index__buy_and_hold_return": {
+      "description": "S&P 500 total-return series",
+      "leg": "index",
+      "source_label": "index:buy_and_hold",
+      "variant": "buy_and_hold"
+    },
+    "index__vol_managed_daily_gross_return": {
+      "description": "S&P 500 total-return series",
+      "leg": "index",
+      "source_label": "index:vol_managed_daily_gross",
+      "variant": "vol_managed_daily_gross"
+    },
+    "index__vol_managed_daily_net_return": {
+      "description": "S&P 500 total-return series",
+      "leg": "index",
+      "source_label": "index:vol_managed_daily_net",
+      "variant": "vol_managed_daily_net"
+    },
+    "index__vol_managed_monthly_gross_return": {
+      "description": "S&P 500 total-return series",
+      "leg": "index",
+      "source_label": "index:vol_managed_monthly_gross",
+      "variant": "vol_managed_monthly_gross"
+    },
+    "index__vol_managed_monthly_net_return": {
+      "description": "S&P 500 total-return series",
+      "leg": "index",
+      "source_label": "index:vol_managed_monthly_net",
+      "variant": "vol_managed_monthly_net"
+    }
+  },
+  "rows": 3649,
+  "schema_version": 1
+}

@@ -1,0 +1,41 @@
+{
+  "artifact_path": "reports/tape_headline_daily_returns.csv.gz",
+  "artifact_sha256": "1685b5402400e440c8777c64a53d4c3483fb0827be27d3b294c85335c1bb999d",
+  "compressed_bytes": 228883,
+  "content": "portfolio-level daily simple returns only",
+  "date_column": "date",
+  "first_date": "1996-01-02",
+  "last_date": "2024-12-31",
+  "metric_policy": {
+    "geometric_sharpe_cash_rate_annual": {
+      "legacy_dsf": 0.02,
+      "v2_ciz": 0.02
+    },
+    "periods_per_year": 252.0,
+    "strategy_gap_threshold_bps": 1.0
+  },
+  "return_columns": {
+    "legacy_benchmark_return": {
+      "portfolio": "sp500_total_return_buy_and_hold",
+      "source_label": "legacy_dsf:sp500_total_return:buy_and_hold",
+      "tape": "legacy_dsf"
+    },
+    "legacy_strategy_return": {
+      "portfolio": "constituent_sma200_semi_monthly",
+      "source_label": "legacy_dsf:constituent_sma200:semi_monthly",
+      "tape": "legacy_dsf"
+    },
+    "v2_benchmark_return": {
+      "portfolio": "sp500_total_return_buy_and_hold",
+      "source_label": "v2_ciz:sp500_total_return:buy_and_hold",
+      "tape": "v2_ciz"
+    },
+    "v2_strategy_return": {
+      "portfolio": "constituent_sma200_semi_monthly",
+      "source_label": "v2_ciz:constituent_sma200:semi_monthly",
+      "tape": "v2_ciz"
+    }
+  },
+  "rows": 7300,
+  "schema_version": 1
+}

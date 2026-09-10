@@ -132,11 +132,74 @@ def vol_managed_weights(
         month = idx.year * 100 + idx.month
         is_month_start = np.r_[True, month[1:] != month[:-1]]
         weights = weights.where(pd.Series(is_month_start, index=idx)).ffill()
+        rebalance_mask = pd.Series(is_month_start, index=idx, dtype=bool)
+    else:
+        rebalance_mask = pd.Series(True, index=weights.index, dtype=bool)
 
     # Warm-up dates have no variance estimate yet. Fill them fully invested so
     # the control gets no credit for sitting out the start of the sample, but
     # never above the cap.
-    return weights.fillna(min(1.0, float(cap)))
+    weights = weights.fillna(min(1.0, float(cap)))
+    weights.attrs["rebalance_mask"] = rebalance_mask
+    return weights
+
+
+def cash_returns_from_annual_yield(annual_yield: pd.Series) -> pd.Series:
+    """Convert annual yields to interval returns using elapsed calendar days."""
+    annual = annual_yield.astype(float)
+    if (annual <= -1.0).any():
+        raise ValueError("Annual cash yields must be greater than -100%.")
+    idx = pd.DatetimeIndex(annual.index)
+    elapsed = idx.to_series().diff().dt.days.fillna(1.0).clip(lower=1.0)
+    return pd.Series(
+        np.power(1.0 + annual.to_numpy(), elapsed.to_numpy() / 365.25) - 1.0,
+        index=idx,
+        dtype=float,
+        name="cash_return",
+    )
+
+
+def _simulate_holdings(
+    base: pd.Series,
+    signal_weights: pd.Series,
+    cash: pd.Series,
+    *,
+    rebalance_mask: pd.Series,
+    cost_bps: float,
+) -> pd.DataFrame:
+    """Trade from drifted holdings, then evolve risky and cash sleeves."""
+    rows: list[dict[str, float]] = []
+    end_weight = 0.0
+    rate = float(cost_bps) / 10_000.0
+
+    for i, dt in enumerate(base.index):
+        pretrade = end_weight
+        rebalance = bool(rebalance_mask.loc[dt]) or i == 0
+        target = float(signal_weights.loc[dt]) if rebalance else pretrade
+        turnover = abs(target - pretrade)
+        cost = turnover * rate
+        risky_growth = target * (1.0 + float(base.loc[dt]))
+        cash_growth = (1.0 - target) * (1.0 + float(cash.loc[dt]))
+        gross_growth = risky_growth + cash_growth
+        net_growth = gross_growth - cost
+        if not np.isfinite(net_growth) or net_growth <= 0.0:
+            raise ValueError("Vol-managed holdings produced nonpositive portfolio wealth.")
+        gross_return = gross_growth - 1.0
+        net_return = net_growth - 1.0
+        end_weight = risky_growth / net_growth
+        rows.append(
+            {
+                "signal_weight": float(signal_weights.loc[dt]),
+                "pretrade_weight": pretrade,
+                "weight": target,
+                "turnover": turnover,
+                "gross_return": gross_return,
+                "cost": cost,
+                "net_return": net_return,
+                "end_weight": end_weight,
+            }
+        )
+    return pd.DataFrame(rows, index=base.index)
 
 
 def apply_vol_management(
@@ -172,30 +235,43 @@ def apply_vol_management(
         Dict with the weight series, gross and net return series, the equity
         curve, realised average weight, and annualised overlay turnover.
     """
+    if cost_bps < 0:
+        raise ValueError("cost_bps must be nonnegative.")
     base = base_returns.astype(float).fillna(0.0)
-    weights = vol_managed_weights(base, c=c, window=window, cap=cap, update=update)
+    signal_weights = vol_managed_weights(
+        base, c=c, window=window, cap=cap, update=update
+    )
+    rebalance_mask = signal_weights.attrs["rebalance_mask"]
 
     if cash_returns is None:
         cash = pd.Series(0.0, index=base.index, dtype=float)
     else:
         cash = cash_returns.reindex(base.index).astype(float).fillna(0.0)
 
-    gross = weights * base + (1.0 - weights) * cash
-
-    # Turnover is the change in exposure; the first date pays for establishing
-    # the initial position.
-    delta = weights.diff()
-    delta.iloc[0] = weights.iloc[0]
-    turnover = delta.abs()
-    cost = turnover * (float(cost_bps) / 10_000.0)
-    net = gross - cost
+    holdings = _simulate_holdings(
+        base,
+        signal_weights,
+        cash,
+        rebalance_mask=rebalance_mask,
+        cost_bps=cost_bps,
+    )
+    weights = holdings["weight"].rename("weight")
+    gross = holdings["gross_return"].rename("gross_return")
+    cost = holdings["cost"].rename("cost")
+    net = holdings["net_return"].rename("net_return")
+    turnover = holdings["turnover"].rename("turnover")
 
     equity = (1.0 + net).cumprod() * float(initial_capital)
     gross_equity = (1.0 + gross).cumprod() * float(initial_capital)
-    years = max(len(base) / 252.0, 1e-9)
+    elapsed_days = max((base.index[-1] - base.index[0]).days + 1, 1)
+    years = elapsed_days / 365.25
 
     return {
         "weights": weights,
+        "signal_weights": signal_weights,
+        "pretrade_weights": holdings["pretrade_weight"],
+        "end_weights": holdings["end_weight"],
+        "turnover": turnover,
         "gross_returns": gross,
         "returns": net,
         "equity_curve": equity,

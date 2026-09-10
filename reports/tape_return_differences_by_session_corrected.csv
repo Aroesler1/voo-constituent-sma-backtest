@@ -1,0 +1,3 @@
+threshold_bps,n_comparable_days,n_legacy_only_days,n_v2_only_days,n_identity_mismatch_days,n_altered_days,pct_altered,mean_abs_diff_bps_altered,median_abs_diff_bps_altered,max_abs_diff_bps,n_tickers_compared,segment
+1.0,5423806,10176,0,0,1,1.8437237615062192e-05,15.349999999999982,15.349999999999982,15.349999999999982,1133,ordinary_session
+1.0,717,18,712,0,665,92.74755927475593,521.3461710022257,92.95487604999985,20000.003999999997,1133,terminal_session

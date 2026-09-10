@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import time
 from contextlib import suppress
@@ -236,6 +237,7 @@ def resolve_snapshot(
             raise FileNotFoundError(f"Snapshot lock id '{lock_id}' not found for {vendor}:{ticker}.")
         with meta_path.open("r", encoding="utf-8") as fh:
             meta = json.load(fh)
+        meta["_metadata_path"] = str(meta_path)
         if not _coverage_ok(meta, start, end):
             raise ValueError(
                 f"Snapshot lock id '{lock_id}' does not cover requested range {start}..{end}."
@@ -248,6 +250,7 @@ def resolve_snapshot(
         try:
             with meta_path.open("r", encoding="utf-8") as fh:
                 meta = json.load(fh)
+            meta["_metadata_path"] = str(meta_path)
             if vendor.lower() == "crsp" and int(meta.get("schema_version", 0)) < CRSP_SNAPSHOT_SCHEMA_VERSION:
                 continue
             if not _coverage_ok(meta, start, end):
@@ -337,7 +340,12 @@ def write_snapshot(
 
 def load_snapshot(meta: dict[str, Any]) -> pd.DataFrame:
     """Load normalized DataFrame from snapshot metadata."""
-    df = pd.read_parquet(meta["normalized_path"])
+    normalized_path = Path(meta["normalized_path"])
+    if not normalized_path.exists() and meta.get("_metadata_path"):
+        relocated = Path(meta["_metadata_path"]).parent / normalized_path.name
+        if relocated.exists():
+            normalized_path = relocated
+    df = pd.read_parquet(normalized_path)
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"])
         if _is_price_like_frame(df):
@@ -524,30 +532,56 @@ def _get_wrds_connection(
     username: str | None,
     password: str | None,
 ):
-    """Create a WRDS connection for CRSP access."""
+    """Open one authorized WRDS connection, without the client's login retries."""
+    if os.environ.get("WRDS_DUO_READY") != "1":
+        raise RuntimeError(
+            "WRDS is disabled. Obtain approval for the Duo push in this session, "
+            "then set WRDS_DUO_READY=1. Cached snapshots need no connection."
+        )
     try:
         import wrds  # type: ignore
+        from sqlalchemy import create_engine
+        from sqlalchemy.engine import URL
+        from sqlalchemy.pool import NullPool
     except ImportError as exc:
         raise ImportError("wrds package is not installed. Add it to the environment to use CRSP.") from exc
 
-    kwargs: dict[str, Any] = {"autoconnect": True, "verbose": False}
+    kwargs: dict[str, Any] = {"autoconnect": False, "verbose": False}
     if username:
         kwargs["wrds_username"] = username
     if password:
         kwargs["wrds_password"] = password
+    # wrds.connect() retries failed authentication and prompts for credentials.
+    # Keep its raw_sql/close interface, but open its SQLAlchemy connection once.
+    # SQLAlchemy is already a required dependency of wrds. NullPool prevents reuse
+    # of a pooled session; there is no pre-ping or automatic retry here.
+    engine = None
     try:
-        return wrds.Connection(**kwargs)
-    except EOFError as exc:
-        # wrds falls back to an interactive input() prompt whenever its own
-        # connect() fails (stale ~/.pgpass, expired password, MFA). Under any
-        # non-interactive caller -- CI, a background run, a notebook kernel --
-        # that surfaces as a bare EOFError, which reads like a bug in this
-        # repo rather than an expired credential. Translate it.
+        client = wrds.Connection(**kwargs)
+        url = URL.create(
+            "postgresql",
+            username=username or None,
+            password=password or None,
+            host=wrds.sql.WRDS_POSTGRES_HOST,
+            port=wrds.sql.WRDS_POSTGRES_PORT,
+            database=wrds.sql.WRDS_POSTGRES_DB,
+        )
+        engine = create_engine(
+            url, isolation_level="AUTOCOMMIT", poolclass=NullPool,
+            connect_args=dict(wrds.sql.WRDS_CONNECT_ARGS),
+        )
+        client.engine = engine
+        client.connection = engine.connect()
+    except Exception:
+        if engine is not None:
+            with suppress(Exception):
+                engine.dispose()
+        # Driver exceptions can contain connection details. Never repeat them.
         raise RuntimeError(
-            "WRDS authentication failed and cannot prompt in a non-interactive "
-            "session. Refresh ~/.pgpass or set WRDS_USERNAME/WRDS_PASSWORD, then "
-            "retry. Cached snapshots are still served without a connection."
-        ) from exc
+            "WRDS setup or connection failed; at most one attempt, no retry or prompt was "
+            "made. Obtain fresh approval before another attempt."
+        ) from None
+    return client
 
 
 def _normalize_crsp_daily(df: pd.DataFrame) -> pd.DataFrame:
@@ -565,6 +599,8 @@ def _normalize_crsp_daily(df: pd.DataFrame) -> pd.DataFrame:
                 "total_return",
                 "retx",
                 "permno",
+                "is_terminal_session",
+                "terminal_return_applied",
             ]
         )
 
@@ -608,6 +644,8 @@ def _normalize_crsp_daily(df: pd.DataFrame) -> pd.DataFrame:
 
     ret = out["ret_raw"]
     dlret = out["dlret_raw"]
+    out["is_terminal_session"] = dlret.notna()
+    out["terminal_return_applied"] = dlret.notna()
     out["total_return"] = np.where(
         ret.notna() & dlret.notna(),
         (1.0 + ret) * (1.0 + dlret) - 1.0,
@@ -636,6 +674,8 @@ def _normalize_crsp_daily(df: pd.DataFrame) -> pd.DataFrame:
             "retx",
             "permno",
             "source_vendor",
+            "is_terminal_session",
+            "terminal_return_applied",
         ]
     ].dropna(subset=["date", "adjusted_close"])
     normalized["volume"] = pd.to_numeric(normalized["volume"], errors="coerce").fillna(0.0)
@@ -823,6 +863,14 @@ def fetch_crsp_batch_prices(
         )
 
     if not missing:
+        return out
+
+    if cfg.OFFLINE_MODE:
+        LOGGER.warning(
+            "Offline mode: %s unresolved CRSP ticker(s) remain missing from cache; "
+            "no connection was attempted.",
+            len(missing),
+        )
         return out
 
     user = username or cfg.WRDS_USERNAME or cfg.CRSP_USERNAME

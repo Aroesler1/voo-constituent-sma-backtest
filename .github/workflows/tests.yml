@@ -22,7 +22,7 @@ jobs:
           # python-dotenv and requests are pulled in transitively by config.py
           # and data_loader.py, which the engine and the CRSP v2 loader import.
           # Both are already in requirements.txt.
-          pip install pytest numpy pandas pyarrow python-dotenv requests
+          pip install pytest numpy pandas pyarrow python-dotenv requests matplotlib
 
       # The suite is deliberately offline: no test reads a vendor API, a
       # database, or a credential. Anything needing licensed data is exercised
@@ -30,3 +30,9 @@ jobs:
       # a secret was configured.
       - name: Run tests
         run: python -m pytest tests -q
+
+      - name: Verify committed schedule tables
+        run: python run_schedule_audit.py --check
+
+      - name: Verify corrected reports from committed daily returns
+        run: python verify_corrected_reports.py
