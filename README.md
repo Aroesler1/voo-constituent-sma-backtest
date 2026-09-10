@@ -170,7 +170,7 @@ group has one observation, so its anchor standard deviation is undefined.
 range is 1.35 pp, while the previously emphasized 3.86 pp also changes trading
 frequency. Anchor choice still matters. The audit does not rescue the strategy
 or estimate the benefit of averaging sub-portfolios. Primary literature and
-remaining checks are in [the review notes](docs/review_2026.md).
+remaining checks are in [the review notes](docs/schedule_review_2026.md).
 
 Five-minute check, entirely offline:
 
@@ -399,8 +399,8 @@ Default reporting schedule is `semi_monthly`, with full comparisons against `dai
 - Corporate-event outliers in crisis periods can still exist in constituent data and should be reviewed before live deployment.
 - **Frequency and anchor sensitivity differ.** The pooled 27-schedule range mixes both. The within-frequency tables isolate anchor dispersion; neither table supplies an uncertainty interval for the semi-monthly headline.
 - **The pre-2010 index-level spread is SPY's, not the fund the strategy would have held.** CRSP's first usable VOO estimate is 2011; SPY's EDGE spread is used for the whole sample and averages 21.2 bps against VOO's 18.4 bps over the overlap.
-- **CIZ delisting returns are not yet bridged.** `crsp.dsf_v2.dlyret` excludes the delisting return that the legacy path compounds in from `crsp.dsedelist`, so the v2 panel understates the loss on a delisted name's final day. This affects one row per delisted security, 350 of the 671 altered constituent-days, and makes the reported tape agreement a lower bound.
-- **The volatility-managed control is only a control.** It is reported to show the pipeline can detect a timing effect the literature documents. It works on the index at monthly rebalancing and fails at daily rebalancing and on the constituent portfolio, and inverse-variance scaling is undefined in any useful sense on a long/flat series that parks in cash.
+- **CIZ delisting returns are bridged through the CIZ delisting table.** 712 CIZ-only terminal rows are restored. 665 of 717 comparable terminal observations still differ from the legacy tape by more than 1 bp because the two tapes place the delisting return on different dates; that is a convention difference and is preserved rather than removed. Ordinary days agree on all but one of 5,423,806.
+- **The volatility-managed control is only a control.** Calibrated on the first half and evaluated on 2010-07-02 to 2024-12-31, the monthly overlay lowers volatility and drawdown but does not raise net geometric Sharpe above buy-and-hold (0.741 against 0.764), and none of the six net overlays passes the Romano-Wolf test. The earlier full-sample version that appeared to beat buy-and-hold used evaluation-period information in its scaling constant and is withdrawn.
 - The cash sleeve borrows at the three-month bill rate when the volatility overlay levers up to its 1.5 cap. A retail account pays more, so that leg is flattered.
 - **WRDS defaults to disabled.** Both CRSP loaders refuse a connection unless `WRDS_DUO_READY=1` is set after approval for the current session. Warm snapshots still work with the gate closed. Unresolved tickers still lack negative-cache entries; if explicitly authorized, a caller may attempt a new resolution. Each connection call makes at most one login attempt and never prompts or retries. Batch all approved queries in one session; do not enable the gate in CI or background jobs.
 
