@@ -274,3 +274,51 @@ def timing_luck_summary(
         )
 
     return pd.DataFrame(rows).sort_values(group_col).reset_index(drop=True)
+
+
+def frequency_isolated_summary(variants: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Separate anchor dispersion from differences in evaluation frequency.
+
+    The sum-of-squares split is descriptive, with one vote per existing anchor.
+    Shared returns and unequal numbers of anchors rule out an ANOVA p-value or
+    a causal interpretation of the between-frequency share.
+    """
+    required = {"sma_length", "frequency", "label", "cagr", "sharpe"}
+    missing = required - set(variants)
+    if missing:
+        raise ValueError(f"variants is missing columns: {sorted(missing)}")
+    if variants.duplicated(["sma_length", "label"]).any():
+        raise ValueError("duplicate rule/schedule rows")
+    if not np.isfinite(variants[["cagr", "sharpe"]].to_numpy(dtype=float)).all():
+        raise ValueError("CAGR and Sharpe must be finite")
+    allowed = {"daily", "weekly", "monthly", "semi_monthly"}
+    if not set(variants["frequency"]).issubset(allowed):
+        raise ValueError("unknown evaluation frequency")
+    anchors = variants[variants["frequency"].isin({"daily", "weekly", "monthly"})]
+    rows, splits = [], []
+    for length, group in anchors.groupby("sma_length", sort=True):
+        mean = float(group.cagr.mean())
+        total = float(((group.cagr - mean) ** 2).sum())
+        within = 0.0
+        between = 0.0
+        for frequency, cell in group.groupby("frequency", sort=True):
+            cell_mean = float(cell.cagr.mean())
+            within += float(((cell.cagr - cell_mean) ** 2).sum())
+            between += len(cell) * (cell_mean - mean) ** 2
+            rows.append({
+                "sma_length": length, "frequency": frequency,
+                "n_anchors": len(cell), "cagr_mean": cell_mean,
+                "cagr_min": float(cell.cagr.min()), "cagr_max": float(cell.cagr.max()),
+                "cagr_range": float(cell.cagr.max() - cell.cagr.min()),
+                "cagr_std": float(cell.cagr.std(ddof=1)) if len(cell) > 1 else np.nan,
+                "sharpe_range": float(cell.sharpe.max() - cell.sharpe.min()),
+            })
+        splits.append({
+            "sma_length": length, "n_anchors": len(group),
+            "pooled_cagr_range": float(group.cagr.max() - group.cagr.min()),
+            "cagr_total_ss": total, "cagr_within_frequency_ss": within,
+            "cagr_between_frequency_ss": between,
+            "within_frequency_share": within / total if total > 0 else np.nan,
+            "between_frequency_share": between / total if total > 0 else np.nan,
+        })
+    return pd.DataFrame(rows), pd.DataFrame(splits)

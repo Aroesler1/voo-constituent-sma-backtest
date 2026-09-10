@@ -58,6 +58,9 @@ class BacktestPanel:
     coverage_ratio: pd.Series
     source_by_date: pd.Series
     provider_mix: dict[str, int]
+    permno_df: pd.DataFrame
+    terminal_mask: pd.DataFrame
+    terminal_applied_mask: pd.DataFrame
     constituentsnapshot_rows: list[dict[str, Any]] = field(default_factory=list)
     voo_daily: pd.DataFrame = field(default_factory=pd.DataFrame)
     spy_daily: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -274,6 +277,25 @@ def _build_return_matrix(
     return mat.fillna(0.0)
 
 
+def _build_raw_field_matrix(
+    price_map: dict[str, pd.DataFrame],
+    tickers: list[str],
+    index: pd.DatetimeIndex,
+    field: str,
+) -> pd.DataFrame:
+    """Build an aligned matrix from one normalized vendor field."""
+    mat = pd.DataFrame(index=index, columns=tickers, dtype=float)
+    for ticker in tickers:
+        df = price_map.get(ticker)
+        if df is None or df.empty:
+            continue
+        d = _to_date_index(df)
+        if field not in d.columns:
+            continue
+        mat[ticker] = pd.to_numeric(d[field], errors="coerce").reindex(index)
+    return mat
+
+
 def _log_return_sanity(
     return_df: pd.DataFrame,
     membership: pd.DataFrame,
@@ -376,10 +398,9 @@ def _fetch_benchmark_series(
     the only price source, and a missing benchmark is a hard failure rather than
     something to paper over with a second-best series.
     """
-    if config.PRIMARY_PRICE_SOURCE != "crsp" or not config.has_crsp_credentials():
+    if config.PRIMARY_PRICE_SOURCE != "crsp":
         raise ValueError(
-            f"Cannot fetch benchmark {ticker}: CRSP is the only price source and "
-            "its credentials are not configured."
+            f"Cannot fetch benchmark {ticker}: CRSP is the only price source."
         )
     crsp_map = fetch_crsp_batch_prices(
         tickers=[ticker],
@@ -419,8 +440,8 @@ def _fetch_constituent_prices(
     the true shortfall.
     """
     requested = sorted({_normalize_ticker(t) for t in tickers if str(t).strip()})
-    if config.PRIMARY_PRICE_SOURCE != "crsp" or not config.has_crsp_credentials():
-        raise ValueError("CRSP is the only price source and its credentials are not configured.")
+    if config.PRIMARY_PRICE_SOURCE != "crsp":
+        raise ValueError("CRSP is the only price source.")
 
     crsp_prices = fetch_crsp_batch_prices(
         tickers=requested,
@@ -607,7 +628,7 @@ def build_panel(
     constituent_fetcher = constituent_fetcher or _fetch_constituent_prices
     benchmark_fetcher = benchmark_fetcher or _fetch_benchmark_series
 
-    if not config.has_crsp_credentials():
+    if not config.OFFLINE_MODE and not config.has_crsp_credentials():
         raise ValueError("Missing CRSP/WRDS credentials; CRSP is the only price source.")
 
     # 1) Universe proxy sources (point-in-time snapshots)
@@ -680,6 +701,15 @@ def build_panel(
     low_df = _build_matrix(constituent_prices, fetched_tickers, trading_index, "low")
     volume_df = _build_matrix(constituent_prices, fetched_tickers, trading_index, "volume")
     close_returns = _build_return_matrix(constituent_prices, fetched_tickers, trading_index)
+    permno_df = _build_raw_field_matrix(
+        constituent_prices, fetched_tickers, trading_index, "permno"
+    )
+    terminal_mask = _build_raw_field_matrix(
+        constituent_prices, fetched_tickers, trading_index, "is_terminal_session"
+    ).fillna(0.0).astype(bool)
+    terminal_applied_mask = _build_raw_field_matrix(
+        constituent_prices, fetched_tickers, trading_index, "terminal_return_applied"
+    ).fillna(0.0).astype(bool)
     del constituent_prices
 
     # Restrict universe to tickers with any usable pricing history.
@@ -689,6 +719,9 @@ def build_panel(
     high_df = high_df[valid_cols]
     low_df = low_df[valid_cols]
     volume_df = volume_df[valid_cols]
+    permno_df = permno_df[valid_cols]
+    terminal_mask = terminal_mask[valid_cols]
+    terminal_applied_mask = terminal_applied_mask[valid_cols]
     open_df = _sanitize_open_matrix(open_df, high_df, low_df, close_df).astype(np.float32)
 
     membership = membership.reindex(columns=valid_cols, fill_value=False)
@@ -780,6 +813,9 @@ def build_panel(
         coverage_ratio=coverage_ratio,
         source_by_date=pd.Series(source_by_date),
         provider_mix=provider_mix,
+        permno_df=permno_df,
+        terminal_mask=terminal_mask,
+        terminal_applied_mask=terminal_applied_mask,
         constituentsnapshot_rows=constituentsnapshot_rows,
         voo_daily=voo_daily,
         spy_daily=spy_daily,

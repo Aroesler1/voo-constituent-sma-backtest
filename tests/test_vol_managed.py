@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from vol_managed import (  # noqa: E402
     apply_vol_management,
     calibrate_c,
+    cash_returns_from_annual_yield,
     realized_variance,
     vol_managed_weights,
 )
@@ -126,11 +127,9 @@ def test_turnover_is_charged_and_reduces_the_net_return():
 
     assert charged["annual_turnover"] > 0
     assert charged["equity_curve"].iloc[-1] < free["equity_curve"].iloc[-1]
-    # The charge is exactly turnover times the rate, including establishing the
-    # first position.
-    delta = free["weights"].diff()
-    delta.iloc[0] = free["weights"].iloc[0]
-    expected_cost = delta.abs() * 25.0 / 10_000.0
+    # The charge is exactly drift-aware turnover times the rate, including
+    # establishing the first position.
+    expected_cost = charged["turnover"] * 25.0 / 10_000.0
     np.testing.assert_allclose(charged["cost_drag"].to_numpy(), expected_cost.to_numpy(), atol=1e-15)
 
 
@@ -149,3 +148,48 @@ def test_rejects_nonpositive_cap():
     r = _returns(n=100)
     with pytest.raises(ValueError):
         vol_managed_weights(r, c=1e-4, cap=0.0)
+
+
+def test_daily_rebalance_trades_from_drifted_holdings():
+    idx = pd.DatetimeIndex(pd.bdate_range("2020-01-02", periods=3))
+    r = pd.Series([0.10, 0.0, 0.0], index=idx)
+    out = apply_vol_management(
+        r,
+        c=1e-4,
+        window=2,
+        cap=0.5,
+        cost_bps=0.0,
+    )
+
+    # The 50% sleeve grows to 0.55 while cash stays 0.50, so the risky weight
+    # entering day two is 0.55/1.05. Restoring 50% requires a real trade even
+    # though the target series itself did not change.
+    expected_pretrade = 0.55 / 1.05
+    assert out["pretrade_weights"].iloc[1] == pytest.approx(expected_pretrade)
+    assert out["turnover"].iloc[1] == pytest.approx(expected_pretrade - 0.5)
+    assert out["signal_weights"].diff().fillna(0.0).abs().iloc[1] == 0.0
+
+
+def test_monthly_weight_drifts_without_daily_rebalancing():
+    idx = pd.DatetimeIndex(pd.bdate_range("2020-01-02", periods=5))
+    r = pd.Series([0.10, 0.0, 0.0, 0.0, 0.0], index=idx)
+    out = apply_vol_management(
+        r,
+        c=1e-4,
+        window=2,
+        cap=0.5,
+        update="monthly",
+        cost_bps=0.0,
+    )
+    assert out["weights"].iloc[1] == pytest.approx(out["pretrade_weights"].iloc[1])
+    assert out["turnover"].iloc[1] == 0.0
+
+
+def test_cash_return_accrues_over_weekend_elapsed_days():
+    idx = pd.DatetimeIndex(["2020-01-03", "2020-01-06"])
+    annual = pd.Series(0.10, index=idx)
+    cash = cash_returns_from_annual_yield(annual)
+
+    assert cash.iloc[0] == pytest.approx((1.10 ** (1 / 365.25)) - 1)
+    assert cash.iloc[1] == pytest.approx((1.10 ** (3 / 365.25)) - 1)
+    assert cash.iloc[1] > 2.9 * cash.iloc[0]

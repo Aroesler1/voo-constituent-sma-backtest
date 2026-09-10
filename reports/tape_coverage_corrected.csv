@@ -1,0 +1,3 @@
+tape,n_tickers,n_covered_constituent_days,n_terminal_sessions,n_terminal_returns_applied,first_date,last_date
+legacy_dsf,1133,5435483,736,0,1996-01-02,2024-12-31
+v2_ciz,1133,5425235,712,712,1996-01-02,2024-12-31
