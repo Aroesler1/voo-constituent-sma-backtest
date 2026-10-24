@@ -13,13 +13,14 @@ data and validation work needed to say that with confidence.
 ## Results
 
 Sample: 1996-01-02 to 2024-12-31, 7,300 trading days, 1,133 constituent tickers resolved in CRSP.
-The benchmark is SPY's total return from CRSP. Sharpe is (CAGR minus 2% cash) over annualised
-volatility. All figures are from the rerun of 2026-10-23.
+The benchmark is SPY's total return from CRSP, the `S&P 500 TR` row of `results_summary.csv` (its
+`Buy-and-Hold` row holds an extended VOO price series instead, at 10.01%). Sharpe here is (CAGR
+minus 2% cash) over annualized volatility. All figures are from the rerun of 2026-10-23.
 
-- The strategy (SMA-200, rebalanced twice a month) returned 8.85% a year against 9.98% for SPY. It
-  ran at lower volatility (16.4% against 19.3%) and a smaller worst drawdown (52.1% against 55.2%),
-  so its Sharpe is about the same (0.419 against 0.414). It turned over 5.7 times a year at an
-  estimated 85 bps of annual cost.
+- The strategy (SMA-200, rebalanced twice a month) returned 8.85% a year against 9.98% for SPY.
+  Lower volatility (16.4% against 19.3%) makes up for the lower return, so its Sharpe is about the
+  same (0.419 against 0.414), and its worst drawdown is smaller (52.1% against 55.2%). It turned
+  over 5.7 times a year at an estimated 85 bps of annual cost.
   Sources: [`tape_comparison_corrected.csv`](reports/tape_comparison_corrected.csv),
   [`results_summary.csv`](reports/results_summary.csv).
 - No SMA length from 150 to 250 days beats SPY in a Romano-Wolf test at 5% family-wise error (0 of
@@ -39,6 +40,8 @@ volatility. All figures are from the rerun of 2026-10-23.
   descriptive split).
   Sources: [`timing_luck_summary.csv`](reports/timing_luck_summary.csv),
   [`timing_luck_frequency_decomposition.csv`](reports/timing_luck_frequency_decomposition.csv).
+
+  ![CAGR across rebalance days for each SMA length, against the S&P 500 total return](figures/timing_luck_box.png)
 - The same rule applied to SPY itself (SMA-200, daily evaluation) earns 7.60% with a 0.451 Sharpe,
   against 5.87% and 0.239 stock by stock. Costs explain more than the whole 1.73 pp gap (1.85 pp).
   Sources: [`index_vs_stock.csv`](reports/index_vs_stock.csv),
