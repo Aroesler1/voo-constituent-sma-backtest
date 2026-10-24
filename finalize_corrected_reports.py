@@ -8,15 +8,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from report_evidence import (
-    CONTROL_DAILY_NAME,
-    CONTROL_MANIFEST_NAME,
-    TAPE_DAILY_NAME,
-    TAPE_MANIFEST_NAME,
-)
 from verify_corrected_reports import verify_corrected_reports
 
 
+# Daily-return evidence is not copied: the runs write the committed subset to
+# reports/ themselves, and the full files (with SPY's CRSP returns) must stay
+# in output/evidence/.
 MAPPINGS = {
     "tape_comparison.csv": "tape_comparison_corrected.csv",
     "tape_coverage.csv": "tape_coverage_corrected.csv",
@@ -26,10 +23,6 @@ MAPPINGS = {
     ),
     "vol_managed_control.csv": "vol_managed_control_corrected.csv",
     "vol_managed_romano_wolf.csv": "vol_managed_romano_wolf_corrected.csv",
-    TAPE_DAILY_NAME: TAPE_DAILY_NAME,
-    TAPE_MANIFEST_NAME: TAPE_MANIFEST_NAME,
-    CONTROL_DAILY_NAME: CONTROL_DAILY_NAME,
-    CONTROL_MANIFEST_NAME: CONTROL_MANIFEST_NAME,
 }
 
 
@@ -45,22 +38,17 @@ def main() -> int:
     parser.add_argument("--ciz-metadata", type=Path)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    args.report_dir.mkdir(parents=True, exist_ok=True)
-    missing = []
-    stale = []
-    for source_name, target_name in MAPPINGS.items():
-        source = args.output_dir / source_name
-        if not source.exists():
-            missing.append(source_name)
-            continue
-        target = args.report_dir / target_name
-        expected = expected_bytes(source)
-        if args.check:
-            if not target.exists() or target.read_bytes() != expected:
-                stale.append(target_name)
-        else:
-            target.write_bytes(expected)
+    # check every input before touching reports/, so a partial run cannot leave
+    # a mix of new and old tracked files behind
+    missing = [
+        name for name in MAPPINGS if not (args.output_dir / name).exists()
+    ]
+    if not args.check and not args.ciz_metadata:
+        missing.append("--ciz-metadata")
+    if missing:
+        raise SystemExit(f"missing corrected inputs: {', '.join(missing)}")
 
+    selected = None
     if args.ciz_metadata:
         metadata = json.loads(args.ciz_metadata.read_text(encoding="utf-8"))
         selected = pd.DataFrame(
@@ -83,20 +71,32 @@ def main() -> int:
                 }
             ]
         ).to_csv(index=False).encode()
+
+    args.report_dir.mkdir(parents=True, exist_ok=True)
+    stale = []
+    for source_name, target_name in MAPPINGS.items():
+        source = args.output_dir / source_name
+        target = args.report_dir / target_name
+        expected = expected_bytes(source)
+        if args.check:
+            if not target.exists() or target.read_bytes() != expected:
+                stale.append(target_name)
+        else:
+            target.write_bytes(expected)
+
+    if selected is not None:
         target = args.report_dir / "ciz_source_validation.csv"
         if args.check:
             if not target.exists() or target.read_bytes() != selected:
                 stale.append(target.name)
         else:
             target.write_bytes(selected)
-    elif not args.check:
-        missing.append("--ciz-metadata")
 
-    if missing:
-        raise SystemExit(f"missing corrected inputs: {', '.join(missing)}")
     if stale:
         raise SystemExit(f"stale corrected reports: {', '.join(stale)}")
-    verify_corrected_reports(args.report_dir)
+    verify_corrected_reports(
+        args.report_dir, evidence_dirs=[args.report_dir, args.output_dir / "evidence"]
+    )
     return 0
 
 

@@ -183,8 +183,13 @@ def compute_metrics(
     annualized_vol = float(rets.std(ddof=1) * np.sqrt(periods_per_year)) if len(rets) > 1 else np.nan
     sharpe = (cagr - cash_rate) / annualized_vol if pd.notna(annualized_vol) and annualized_vol > 0 else np.nan
 
-    downside = rets[rets < 0]
-    downside_dev = float(downside.std(ddof=1) * np.sqrt(periods_per_year)) if len(downside) > 1 else np.nan
+    # downside deviation below a zero target over ALL periods (Sortino and
+    # Price), not the dispersion of the negative returns around their own mean
+    downside_dev = (
+        float(np.sqrt(np.mean(np.minimum(rets.to_numpy(dtype=float), 0.0) ** 2)) * np.sqrt(periods_per_year))
+        if len(rets) > 1
+        else np.nan
+    )
     sortino = (cagr - cash_rate) / downside_dev if pd.notna(downside_dev) and downside_dev > 0 else np.nan
 
     dd = compute_drawdown_series(eq)

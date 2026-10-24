@@ -158,3 +158,30 @@ def test_annualised_cost_is_scaled_by_trading_days_not_trade_days():
     assert met["total_cost_bps_annualized"] == pytest.approx(expected_bps, rel=1e-9)
     # The old behaviour would have reported 252/12 times this.
     assert met["total_cost_bps_annualized"] < expected_bps * 5
+
+
+@pytest.mark.parametrize(
+    "spread_model, sma_days, expected",
+    [("edge", 200, "EDGE"), ("corwin_schultz", 150, "Corwin-Schultz")],
+)
+def test_detailed_report_names_the_configured_spread_model(
+    tmp_path, spread_model, sma_days, expected
+):
+    from config import BacktestConfig
+    from reporting import write_detailed_report
+
+    cfg = BacktestConfig(OFFLINE_MODE=True, SPREAD_MODEL=spread_model, SMA_LENGTH_DAYS=sma_days)
+    path = write_detailed_report(
+        output_dir=str(tmp_path),
+        summary_metrics={"Strategy": {"cagr": 0.08}, "Buy-and-Hold": {"cagr": 0.10}},
+        schedule_df=pd.DataFrame(),
+        sma_sweep_df=pd.DataFrame(),
+        fidelity_report=pd.DataFrame({"section": []}),
+        periods={},
+        config=cfg,
+    )
+    text = path.read_text(encoding="utf-8")
+    realism = next(line for line in text.splitlines() if "spread estimates" in line)
+    assert expected in realism
+    assert ("Corwin-Schultz" in realism) == (spread_model == "corwin_schultz")
+    assert f"`{sma_days}-day SMA`" in text

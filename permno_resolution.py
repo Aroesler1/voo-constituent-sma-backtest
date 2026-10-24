@@ -18,6 +18,7 @@ name-history fetch needs credentials.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 # CRSP share codes for ordinary common equity. ETFs (73) and other fund
@@ -42,7 +43,11 @@ def normalise_name_history(frame: pd.DataFrame) -> pd.DataFrame:
             out[col] = out[col].astype(str).str.upper().str.strip().replace({"NAN": "", "NONE": ""})
         else:
             out[col] = ""
-    out["ticker"] = out["ticker"].astype(str).str.upper().str.strip()
+    # a missing ticker must stay empty, not become the string "<NA>" or "NAN"
+    out["ticker"] = (
+        out["ticker"].astype(str).str.upper().str.strip()
+        .replace({"<NA>": "", "NAN": "", "NONE": ""})
+    )
     out["permno"] = pd.to_numeric(out["permno"], errors="coerce").astype("Int64")
     for col in ("namedt", "nameendt"):
         out[col] = pd.to_datetime(out[col], errors="coerce")
@@ -161,3 +166,167 @@ def select_primary(membership: pd.DataFrame, priority: pd.DataFrame) -> pd.DataF
     return (merged.drop_duplicates(subset=["date", "ticker"], keep="first")
             .drop(columns="rank")
             .reset_index(drop=True))
+
+
+# lower is preferred when two securities carry a ticker on the same day; the
+# same order the CRSP loaders use to de-duplicate a ticker's rows
+SHARE_PRIORITY = {11: 0, 10: 1, 18: 2, 12: 3, 41: 4, 40: 5, 42: 6, 48: 7, 71: 8, 70: 9, 72: 10}
+INTERVAL_COLUMNS = ["ticker", "permno", "crsp_ticker", "start", "end", "method"]
+
+
+def membership_intervals(membership: pd.DataFrame) -> pd.DataFrame:
+    """Contiguous runs of a boolean membership matrix as (ticker, start, end)."""
+    rows = []
+    index = pd.DatetimeIndex(membership.index)
+    for ticker in membership.columns:
+        flags = membership[ticker].fillna(False).to_numpy(dtype=bool)
+        if not flags.any():
+            continue
+        edges = np.diff(np.r_[0, flags.astype(int), 0])
+        for start, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1) - 1):
+            rows.append({"ticker": ticker, "start": index[start], "end": index[stop]})
+    return pd.DataFrame(rows, columns=["ticker", "start", "end"])
+
+
+def _runs(days: pd.DatetimeIndex, labels: np.ndarray) -> list[tuple[int, pd.Timestamp, pd.Timestamp]]:
+    """Compress a per-day label array (-1 = none) into (label, first, last) runs."""
+    out = []
+    if len(days) == 0:
+        return out
+    breaks = np.flatnonzero(np.diff(labels) != 0) + 1
+    for lo, hi in zip(np.r_[0, breaks], np.r_[breaks, len(days)] - 1):
+        out.append((int(labels[lo]), days[lo], days[hi]))
+    return out
+
+
+def _assign_days(days: pd.DatetimeIndex, candidates: pd.DataFrame, rank_columns: list[str]) -> np.ndarray:
+    """Pick one candidate row per day; candidates carry namedt/nameendt windows."""
+    best = np.full(len(days), -1, dtype=int)
+    if candidates.empty:
+        return best
+    ordered = candidates.sort_values(rank_columns, kind="mergesort")
+    values = days.values
+    # walk from worst to best so the preferred candidate is written last
+    for pos in range(len(ordered) - 1, -1, -1):
+        row = ordered.iloc[pos]
+        alive = (values >= np.datetime64(row["namedt"])) & (values <= np.datetime64(row["nameendt"]))
+        best[alive] = int(row["_row"])
+    return best
+
+
+def resolve_membership_intervals(
+    intervals: pd.DataFrame,
+    name_history: pd.DataFrame,
+    share_codes: tuple[int, ...] = COMMON_SHARE_CODES,
+) -> pd.DataFrame:
+    """Map each membership interval to the CRSP security that was the member.
+
+    Index membership files key members by ticker, and they are not consistent
+    about which ticker: some use the symbol of the day, some the company's
+    current symbol for its whole history (WBA for Walgreens' years as WAG),
+    some a hyphenated share class CRSP does not store (BRK-B). Matching the
+    file's ticker against CRSP's ticker of the day silently drops every member
+    the second and third conventions describe.
+
+    Rows returned, one per resolved stretch of an interval:
+
+    - ``direct``: CRSP carried the member ticker on those days.
+    - ``share_class``: a hyphenated ticker matched on base symbol plus shrcls.
+    - ``renamed``: no security carried the ticker then, but one that carried it
+      at another time existed under a different ticker; that PERMNO is used,
+      preferring the one whose matching record is closest in time.
+    - ``unresolved``: nothing matches (for example post-bankruptcy "Q"
+      symbols, which CRSP never lists); ``permno`` is missing.
+
+    A PERMNO-day claimed directly by one member is never also handed to
+    another member through a non-direct match, so a renamed match cannot
+    double count a security.
+    """
+    history = normalise_name_history(name_history)
+    if share_codes is not None:
+        history = history[history["shrcd"].isin(list(share_codes))]
+    history = history.reset_index(drop=True)
+    history["_row"] = np.arange(len(history))
+    history["_priority"] = history["shrcd"].map(SHARE_PRIORITY).fillna(99)
+
+    segments: list[dict] = []
+    for item in intervals.itertuples(index=False):
+        ticker = str(item.ticker).upper().strip()
+        start, end = pd.Timestamp(item.start), pd.Timestamp(item.end)
+        days = pd.bdate_range(start, end)
+        if len(days) == 0:
+            continue
+        base, share_class = split_share_class(ticker)
+        matches = history[history["ticker"] == ticker]
+        method = "direct"
+        if matches.empty and share_class:
+            matches = history[(history["ticker"] == base) & (history["shrcls"] == share_class)]
+            method = "share_class"
+
+        # 1) securities that carried the ticker on the day itself
+        direct = matches.assign(_neg_permno=-matches["permno"].astype("int64"))
+        labels = _assign_days(days, direct, ["_priority", "exchcd", "_neg_permno"])
+
+        # 2) for days still open, a security that carried the ticker at another
+        # time and existed then under some other ticker
+        open_days = labels < 0
+        if open_days.any() and not matches.empty:
+            permnos = matches["permno"].astype("int64").unique()
+            others = history[history["permno"].astype("int64").isin(permnos)].copy()
+            # distance from each record to the nearest record with the ticker
+            anchor = matches.groupby(matches["permno"].astype("int64"))
+            mid = days[open_days][len(days[open_days]) // 2]
+            nearest = {
+                int(p): float(min(abs((g["namedt"] - mid).dt.days).min(), abs((g["nameendt"].clip(upper=pd.Timestamp("2100-01-01")) - mid).dt.days).min()))
+                for p, g in anchor
+            }
+            others["_distance"] = others["permno"].astype("int64").map(nearest)
+            others["_neg_permno"] = -others["permno"].astype("int64")
+            renamed = _assign_days(days, others, ["_distance", "_priority", "_neg_permno"])
+            labels = np.where(open_days, renamed, labels)
+            renamed_rows = set(np.unique(renamed[open_days & (renamed >= 0)]).tolist())
+        else:
+            renamed_rows = set()
+
+        for row_id, first, last in _runs(days, labels):
+            if row_id < 0:
+                segments.append({"ticker": ticker, "permno": pd.NA, "crsp_ticker": "",
+                                 "start": first, "end": last, "method": "unresolved"})
+                continue
+            rec = history.iloc[row_id]
+            segments.append({
+                "ticker": ticker,
+                "permno": int(rec["permno"]),
+                "crsp_ticker": str(rec["ticker"]),
+                "start": first,
+                "end": last,
+                "method": "renamed" if row_id in renamed_rows and str(rec["ticker"]) != base else method,
+            })
+
+    out = pd.DataFrame(segments, columns=INTERVAL_COLUMNS)
+    return _drop_double_claims(out)
+
+
+def _drop_double_claims(segments: pd.DataFrame) -> pd.DataFrame:
+    """Trim non-direct stretches that another member already holds directly."""
+    if segments.empty:
+        return segments
+    direct = segments[segments["method"].isin(["direct", "share_class"])]
+    kept = []
+    for seg in segments.itertuples(index=False):
+        if seg.method not in ("renamed",):
+            kept.append(seg._asdict())
+            continue
+        claims = direct[(direct["permno"] == seg.permno) & (direct["ticker"] != seg.ticker)
+                        & (direct["start"] <= seg.end) & (direct["end"] >= seg.start)]
+        days = pd.bdate_range(seg.start, seg.end)
+        free = np.ones(len(days), dtype=bool)
+        for claim in claims.itertuples(index=False):
+            free &= ~((days >= claim.start) & (days <= claim.end))
+        for flag, first, last in _runs(days, free.astype(int)):
+            row = seg._asdict()
+            row.update(start=first, end=last)
+            if not flag:
+                row.update(permno=pd.NA, crsp_ticker="", method="unresolved")
+            kept.append(row)
+    return pd.DataFrame(kept, columns=INTERVAL_COLUMNS).reset_index(drop=True)

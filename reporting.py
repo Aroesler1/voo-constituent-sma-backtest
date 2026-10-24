@@ -538,6 +538,12 @@ def write_detailed_report(
     """Write a markdown report summarizing the full backtest outcome."""
     out_dir = _ensure_output_dir(output_dir)
     default_label = str(getattr(config, "REBALANCE_DEFAULT", "default"))
+    sma_days = int(getattr(config, "SMA_LENGTH_DAYS", 200))
+    # name the spread estimator the run actually used (EDGE is the default)
+    spread_label = {
+        "edge": "EDGE (Ardia-Guidotti-Kroencke)",
+        "corwin_schultz": "Corwin-Schultz",
+    }.get(str(getattr(config, "SPREAD_MODEL", "edge")), "modeled")
     strategy = summary_metrics.get("Strategy", {})
     benchmark = summary_metrics.get("Buy-and-Hold", {})
     fidelity_overall = fidelity_report.loc[fidelity_report["section"].eq("overall")].head(1).copy()
@@ -548,7 +554,7 @@ def write_detailed_report(
     lines.append("## Executive Summary")
     lines.append("")
     lines.append(
-        f"- Default implementation schedule: `{default_label}` with `200-day SMA`, `next_open` execution, and point-in-time constituent membership."
+        f"- Default implementation schedule: `{default_label}` with `{sma_days}-day SMA`, `next_open` execution, and point-in-time constituent membership."
     )
     lines.append(
         f"- Strategy CAGR `{_format_metric(strategy.get('cagr', np.nan))}`, Sharpe `{_format_metric(strategy.get('sharpe', np.nan))}`, max drawdown `{_format_metric(strategy.get('max_drawdown', np.nan))}`."
@@ -563,7 +569,7 @@ def write_detailed_report(
     lines.append("## Implementation Realism")
     lines.append("")
     lines.append("- Cash sleeve uses time-varying 3M Treasury data when available.")
-    lines.append("- Execution assumes next-session open, opening-auction slippage, Corwin-Schultz spread estimates, retail-sized market impact, and sell-side FINRA TAF.")
+    lines.append(f"- Execution assumes next-session open, opening-auction slippage, {spread_label} spread estimates, retail-sized market impact, and sell-side FINRA TAF.")
     lines.append("- Point-in-time membership is lagged and snapshot-backed; price snapshots are frozen for reproducibility.")
     lines.append("- Residual limitation: pre-2019 constituent history remains a public proxy, not a licensed S&P point-in-time master.")
     lines.append("")

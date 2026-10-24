@@ -12,6 +12,11 @@ Input is the per-configuration daily return panel written by `main.py` as
 `output/sma_sweep_returns.csv`: one column per SMA length, one row per trading
 day, all five evaluated on the same dates.
 
+The Deflated Sharpe printed here uses the same inputs as ``main.py``: daily
+returns in excess of the cash rate, and a trial count covering the SMA grid
+plus the rebalance-schedule sweep. PBO ranks configurations on the raw returns,
+as ``main.py`` does.
+
 Usage:
     python run_pbo.py
     python run_pbo.py --returns output/sma_sweep_returns.csv --n-splits 16
@@ -19,19 +24,36 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from config import BacktestConfig
 from statistics_mt import (
     deflated_sharpe,
     per_period_sharpe,
     probability_of_backtest_overfitting,
 )
 
+_DEFAULTS = BacktestConfig()
+
 TRADING_DAYS = 252
+
+
+def sweep_deflated_sharpe(panel: pd.DataFrame, *, cash_rate: float, n_trials: int) -> dict[str, float]:
+    """Deflated Sharpe per configuration on returns in excess of cash.
+
+    Mirrors ``main.py``: excess return is the daily return minus the annual
+    cash rate over 252, and the cross-trial Sharpe dispersion comes from the
+    same excess series.
+    """
+    excess = panel - float(cash_rate) / TRADING_DAYS
+    trial_sharpes = [per_period_sharpe(excess[c]) for c in excess.columns]
+    return {
+        c: deflated_sharpe(excess[c], n_trials=int(n_trials), trial_sharpes=trial_sharpes)
+        for c in excess.columns
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -43,6 +65,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--n-splits", type=int, default=16,
                     help="CSCV blocks; must be even (16 -> C(16,8) = 12,870 splits)")
     ap.add_argument("--out", type=Path, default=Path("output/pbo_sweep.csv"))
+    ap.add_argument("--report-dir", type=str, default="reports",
+                    help="tracked copy of the PBO table; pass '' to skip")
+    ap.add_argument("--cash-rate", type=float, default=float(_DEFAULTS.CASH_RATE_ANNUAL),
+                    help="annual cash rate subtracted before the Deflated Sharpe, as in main.py")
+    ap.add_argument("--n-trials", type=int,
+                    default=len(_DEFAULTS.SMA_SWEEP_VALUES) + len(_DEFAULTS.REBALANCE_SWEEP_VALUES),
+                    help="multiple-testing trial count; main.py uses SMA grid + schedule sweep")
     args = ap.parse_args(argv)
 
     if not args.returns.exists():
@@ -59,13 +88,8 @@ def main(argv: list[str] | None = None) -> int:
     result = probability_of_backtest_overfitting(panel, n_splits=args.n_splits)
 
     sharpes = {c: per_period_sharpe(panel[c]) for c in panel.columns}
-    trial_sharpes = list(sharpes.values())
     best_cfg = max(sharpes, key=sharpes.get)
-    dsr = {
-        c: deflated_sharpe(panel[c], n_trials=len(panel.columns),
-                           trial_sharpes=trial_sharpes)
-        for c in panel.columns
-    }
+    dsr = sweep_deflated_sharpe(panel, cash_rate=args.cash_rate, n_trials=args.n_trials)
 
     print(f"sweep: {panel.shape[1]} configurations, {len(panel):,} daily observations "
           f"({panel.index.min().date()} -> {panel.index.max().date()})")
@@ -92,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
           f"values, so this is an indicator, not a precise probability.")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({
+    table_out = pd.DataFrame({
         "pbo": [result["pbo"]],
         "n_combinations": [result["n_combinations"]],
         "n_configs": [result["n_configs"]],
@@ -100,7 +124,12 @@ def main(argv: list[str] | None = None) -> int:
         "obs_used": [result["obs_used"]],
         "median_oos_rank": [result["median_oos_rank"]],
         "best_config_full_sample": [best_cfg],
-    }).to_csv(args.out, index=False)
+        "deflated_sharpe_best": [dsr[best_cfg]],
+    })
+    table_out.to_csv(args.out, index=False)
+    if args.report_dir:
+        Path(args.report_dir).mkdir(parents=True, exist_ok=True)
+        table_out.to_csv(Path(args.report_dir) / "pbo_sweep.csv", index=False)
     print(f"\nsaved -> {args.out}")
     return 0
 

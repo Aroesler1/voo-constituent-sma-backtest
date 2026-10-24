@@ -17,7 +17,7 @@ therefore be close to tape-invariant. ``run_tape_compare.py`` checks whether it
 is.
 
 The frozen cache records the historical CIZ daily-table assumption. A new live
-pull does not reuse that assumption: it requires the approved metadata query's
+pull does not reuse that assumption: it requires the WRDS metadata query's
 verified daily source name in the same provenance sidecar as terminal outcomes.
 
 Two deliberate choices keep the comparison clean:
@@ -152,6 +152,50 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_corrected_cache_version(version: str) -> str:
+    """Accept only the versioned directory names that a verified extract produces."""
+    if not re.fullmatch(rf"{V2_TERMINAL_CACHE_VERSION}-[0-9a-f]{{12}}", str(version)):
+        raise ValueError(
+            f"CIZ_CORRECTED_CACHE_VERSION must look like {V2_TERMINAL_CACHE_VERSION}-<12 hex>."
+        )
+    return str(version)
+
+
+def terminal_outcomes_from_corrected_cache(
+    config: BacktestConfig,
+    start: str,
+    end: str,
+) -> pd.DataFrame:
+    """Rebuild the terminal events a corrected cache carries, by PERMNO.
+
+    The corrected per-ticker caches keep the extract's ``terminal_return`` and
+    ``legacy_event_date`` on each restored or marked row, which is all the tape
+    comparison needs to mark terminal sessions without the extract itself.
+    """
+    version = validate_corrected_cache_version(str(config.CIZ_CORRECTED_CACHE_VERSION))
+    directory = Path(config.CACHE_DIR) / V2_CACHE_DIRNAME / version
+    frames = []
+    for path in sorted(directory.glob(f"crspv2_*_{start}_{end}.parquet")):
+        frame = pd.read_parquet(path)
+        if "terminal_return" not in frame.columns:
+            continue
+        hits = frame[frame["terminal_return"].notna()]
+        if hits.empty:
+            continue
+        cols = ["permno", "date", "terminal_return"]
+        if "legacy_event_date" in hits.columns:
+            cols.append("legacy_event_date")
+        frames.append(hits[cols])
+    if not frames:
+        return pd.DataFrame(columns=["permno", "event_date", "terminal_return", "legacy_event_date"])
+    out = pd.concat(frames, ignore_index=True).rename(columns={"date": "event_date"})
+    out["permno"] = pd.to_numeric(out["permno"], errors="raise").astype("int64")
+    out["event_date"] = pd.to_datetime(out["event_date"])
+    if "legacy_event_date" in out.columns:
+        out["legacy_event_date"] = pd.to_datetime(out["legacy_event_date"], errors="coerce")
+    return out.drop_duplicates(["permno", "event_date"]).sort_values(["permno", "event_date"]).reset_index(drop=True)
+
+
 def load_verified_terminal_outcomes(
     extract_path: str | Path,
     metadata_path: str | Path,
@@ -235,7 +279,9 @@ def apply_terminal_outcomes(
     if return_semantics not in TERMINAL_SEMANTICS:
         raise ValueError("Unknown CIZ terminal-return semantics; refusing to infer them.")
 
-    out = normalized.copy()
+    # a fresh RangeIndex keeps out.loc[len(out)] below an append; a date-filtered
+    # cache slice can carry labels that make len(out) collide with a real row
+    out = normalized.reset_index(drop=True)
     out["date"] = pd.to_datetime(out["date"], errors="raise")
     out["permno"] = pd.to_numeric(out["permno"], errors="raise").astype("int64")
     events = outcomes.rename(columns={"event_date": "date"}).copy()
@@ -358,6 +404,7 @@ def fetch_crsp_v2_batch_prices(
     missing: list[str] = []
     terminal_source: tuple[pd.DataFrame, dict[str, Any]] | None = None
     corrected_version: str | None = None
+    corrected_only = False
     if cfg.CIZ_TERMINAL_RETURNS_PATH and cfg.CIZ_TERMINAL_METADATA_PATH:
         terminal_source = load_verified_terminal_outcomes(
             cfg.CIZ_TERMINAL_RETURNS_PATH,
@@ -365,6 +412,11 @@ def fetch_crsp_v2_batch_prices(
         )
         source_hash = terminal_source[1]["extract_sha256"][:12]
         corrected_version = f"{V2_TERMINAL_CACHE_VERSION}-{source_hash}"
+    elif cfg.CIZ_CORRECTED_CACHE_VERSION:
+        # reuse caches an earlier run already corrected with a verified extract;
+        # never mix them with uncorrected caches, and never write
+        corrected_version = validate_corrected_cache_version(cfg.CIZ_CORRECTED_CACHE_VERSION)
+        corrected_only = True
 
     for ticker in requested:
         if corrected_version is not None:
@@ -376,6 +428,9 @@ def fetch_crsp_v2_batch_prices(
                 if not cached.empty:
                     out[ticker] = cached
                     continue
+            if corrected_only:
+                missing.append(ticker)
+                continue
 
         for path in _covering_cache_paths(cfg, ticker, start, end):
             if not path.exists():

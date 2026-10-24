@@ -1,0 +1,2 @@
+pbo,n_combinations,n_configs,n_splits,obs_used,median_oos_rank,best_config_full_sample,deflated_sharpe_best
+0.8668220668220669,12870,5,16,7296,2.0,sma_250,0.9947965295098933

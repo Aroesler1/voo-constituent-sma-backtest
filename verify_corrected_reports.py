@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""Recompute corrected headline arithmetic from committed daily aggregates."""
+"""Recompute corrected headline arithmetic from portfolio-level daily returns.
+
+Evidence comes from two places. ``reports/`` holds committed series built from
+the constituent portfolio; ``output/evidence/`` holds the full local copy that
+also carries SPY's CRSP returns and is never committed. Every metric whose
+series is present is recomputed; benchmark and index-leg metrics are skipped,
+and counted as skipped, when only the committed copy exists.
+"""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from report_evidence import LOCAL_EVIDENCE_DIR
 
 
 PERIODS_PER_YEAR = 252.0
@@ -21,8 +31,14 @@ def compute_return_metrics(
     *,
     cash_rate_annual: float,
     periods_per_year: float = PERIODS_PER_YEAR,
+    first_row_is_start: bool = True,
 ) -> dict[str, float]:
-    """Independently recompute the headline metrics from simple returns."""
+    """Independently recompute the headline metrics from simple returns.
+
+    ``first_row_is_start`` says whether the first row is the starting point of
+    the equity curve (a backtest's day 0, return zero) or already a return.
+    In the second case every return compounds and the curve starts at 1.0.
+    """
     rets = pd.to_numeric(returns, errors="raise").dropna().astype(float)
     if len(rets) < 2:
         raise ValueError("Need at least two daily returns.")
@@ -31,8 +47,13 @@ def compute_return_metrics(
     if (rets <= -1.0).any():
         raise ValueError("Daily returns must stay above -100%.")
 
-    equity = (1.0 + rets).cumprod()
-    total_periods = len(equity) - 1
+    growth = (1.0 + rets).cumprod()
+    if first_row_is_start:
+        equity = growth
+        total_periods = len(equity) - 1
+    else:
+        equity = pd.concat([pd.Series([1.0]), growth.reset_index(drop=True)], ignore_index=True)
+        total_periods = len(rets)
     cagr = (
         (float(equity.iloc[-1]) / float(equity.iloc[0]))
         ** (float(periods_per_year) / total_periods)
@@ -75,57 +96,80 @@ def compute_arithmetic_sharpe(
     return float(excess.mean() / std * np.sqrt(periods_per_year))
 
 
-def _resolve_report_path(report_dir: Path, reference: str) -> Path:
-    relative = Path(str(reference))
-    if relative.is_absolute() or ".." in relative.parts:
-        raise ValueError(f"Invalid committed report path: {reference}")
-    if relative.parts and relative.parts[0] == "reports":
-        relative = Path(*relative.parts[1:])
-    candidate = (report_dir / relative).resolve()
-    root = report_dir.resolve()
-    if candidate != root and root not in candidate.parents:
-        raise ValueError(f"Report path escapes report directory: {reference}")
-    return candidate
+@dataclass
+class EvidenceColumn:
+    """One daily-return series and the policy of the file it came from."""
+
+    values: pd.Series
+    policy: dict[str, Any]
+    cash_column: str | None
+    source: Path
 
 
-def _load_evidence(
-    report_dir: Path,
-    artifact_reference: str,
-    manifest_reference: str,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    artifact_path = _resolve_report_path(report_dir, artifact_reference)
-    manifest_path = _resolve_report_path(report_dir, manifest_reference)
+def _load_manifest(manifest_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("artifact_path") != artifact_reference:
-        raise ValueError(
-            f"{manifest_path.name} points to {manifest.get('artifact_path')!r}, "
-            f"not {artifact_reference!r}."
-        )
+    name = str(manifest.get("artifact_file", ""))
+    if not name or Path(name).name != name:
+        raise ValueError(f"{manifest_path.name} must name an artifact file in its own directory.")
+    artifact_path = manifest_path.parent / name
     payload = artifact_path.read_bytes()
-    digest = hashlib.sha256(payload).hexdigest()
-    if digest != manifest.get("artifact_sha256"):
-        raise ValueError(f"SHA-256 mismatch for {artifact_reference}.")
+    if hashlib.sha256(payload).hexdigest() != manifest.get("artifact_sha256"):
+        raise ValueError(f"SHA-256 mismatch for {artifact_path}.")
 
     daily = pd.read_csv(artifact_path)
     expected_columns = {"date", *manifest.get("return_columns", {}).keys()}
     if set(daily.columns) != expected_columns:
         raise ValueError(
-            f"{artifact_reference} columns are {list(daily.columns)!r}; "
+            f"{artifact_path.name} columns are {list(daily.columns)!r}; "
             f"manifest permits only {sorted(expected_columns)!r}."
         )
     dates = pd.to_datetime(daily["date"], errors="raise")
     if dates.duplicated().any() or not dates.is_monotonic_increasing:
-        raise ValueError(f"{artifact_reference} dates must be unique and sorted.")
+        raise ValueError(f"{artifact_path.name} dates must be unique and sorted.")
     daily.index = pd.DatetimeIndex(dates)
     daily = daily.drop(columns="date")
-
     if len(daily) != int(manifest["rows"]):
-        raise ValueError(f"Row-count mismatch for {artifact_reference}.")
+        raise ValueError(f"Row-count mismatch for {artifact_path.name}.")
     if daily.index.min().date().isoformat() != manifest["first_date"]:
-        raise ValueError(f"First-date mismatch for {artifact_reference}.")
+        raise ValueError(f"First-date mismatch for {artifact_path.name}.")
     if daily.index.max().date().isoformat() != manifest["last_date"]:
-        raise ValueError(f"Last-date mismatch for {artifact_reference}.")
+        raise ValueError(f"Last-date mismatch for {artifact_path.name}.")
     return daily, manifest
+
+
+def load_evidence(evidence_dirs: list[Path]) -> dict[str, EvidenceColumn]:
+    """Every daily-return column available across the evidence directories.
+
+    A column present in more than one file must carry identical values, so the
+    committed subset cannot drift from the local full copy.
+    """
+    columns: dict[str, EvidenceColumn] = {}
+    for directory in evidence_dirs:
+        if not directory.is_dir():
+            continue
+        for manifest_path in sorted(directory.glob("*.manifest.json")):
+            daily, manifest = _load_manifest(manifest_path)
+            for column in daily.columns:
+                entry = EvidenceColumn(
+                    values=daily[column],
+                    policy=manifest.get("metric_policy", {}),
+                    cash_column=manifest.get("cash_return_column"),
+                    source=manifest_path,
+                )
+                if column in columns:
+                    previous = columns[column].values
+                    same = previous.index.equals(entry.values.index) and np.allclose(
+                        previous.to_numpy(dtype=float),
+                        entry.values.to_numpy(dtype=float),
+                        rtol=0.0,
+                        atol=0.0,
+                        equal_nan=True,
+                    )
+                    if not same:
+                        raise ValueError(f"Evidence column {column} differs between files.")
+                    continue
+                columns[column] = entry
+    return columns
 
 
 def _check_close(
@@ -146,291 +190,202 @@ def _check_close(
         )
 
 
+def _metrics_for(column: EvidenceColumn, cash_rate: float) -> dict[str, float]:
+    return compute_return_metrics(
+        column.values.dropna(),
+        cash_rate_annual=cash_rate,
+        periods_per_year=float(column.policy.get("periods_per_year", PERIODS_PER_YEAR)),
+        first_row_is_start=bool(column.policy.get("first_row_is_start", True)),
+    )
+
+
 def _verify_tape_reports(
     report_dir: Path,
+    columns: dict[str, EvidenceColumn],
     *,
     rtol: float,
     atol: float,
-) -> tuple[int, int]:
+) -> dict[str, int]:
     summary = pd.read_csv(report_dir / "tape_comparison_corrected.csv")
     required = {
-        "tape",
-        "n_days",
-        "first_date",
-        "last_date",
-        "strategy_cagr",
-        "strategy_vol",
-        "strategy_sharpe",
-        "strategy_max_drawdown",
-        "index_cagr",
-        "index_sharpe",
-        "strategy_daily_returns_path",
-        "strategy_return_column",
-        "benchmark_daily_returns_path",
-        "benchmark_return_column",
-        "daily_returns_manifest_path",
+        "tape", "n_days", "first_date", "last_date", "strategy_cagr", "strategy_vol",
+        "strategy_sharpe", "strategy_max_drawdown", "index_cagr", "index_sharpe",
+        "strategy_return_column", "benchmark_return_column",
     }
     missing = required - set(summary.columns)
     if missing:
         raise ValueError(f"Tape summary is missing evidence columns: {sorted(missing)}")
 
     failures: list[str] = []
-    daily: pd.DataFrame | None = None
-    manifest: dict[str, Any] | None = None
+    skipped = 0
     for row in summary.to_dict(orient="records"):
-        if row["strategy_daily_returns_path"] != row["benchmark_daily_returns_path"]:
-            raise ValueError(f"{row['tape']} strategy and benchmark paths differ.")
-        row_daily, row_manifest = _load_evidence(
-            report_dir,
-            row["strategy_daily_returns_path"],
-            row["daily_returns_manifest_path"],
-        )
-        if daily is None:
-            daily, manifest = row_daily, row_manifest
-        strategy = row_daily[row["strategy_return_column"]].dropna()
-        benchmark = row_daily[row["benchmark_return_column"]].dropna()
-        cash_rates = row_manifest["metric_policy"][
-            "geometric_sharpe_cash_rate_annual"
-        ]
-        metrics = compute_return_metrics(
-            strategy,
-            cash_rate_annual=float(cash_rates[row["tape"]]),
-        )
-        benchmark_metrics = compute_return_metrics(
-            benchmark,
-            cash_rate_annual=float(cash_rates[row["tape"]]),
-        )
         prefix = f"tape {row['tape']}"
+        strategy_col = columns.get(row["strategy_return_column"])
+        if strategy_col is None:
+            raise ValueError(f"{prefix}: strategy series {row['strategy_return_column']} is not in any evidence file.")
+        cash_rate = float(strategy_col.policy["geometric_sharpe_cash_rate_annual"][row["tape"]])
+        strategy = strategy_col.values.dropna()
+        metrics = _metrics_for(strategy_col, cash_rate)
         for metric, column in (
             ("cagr", "strategy_cagr"),
             ("annualized_vol", "strategy_vol"),
             ("sharpe_geometric", "strategy_sharpe"),
             ("max_drawdown", "strategy_max_drawdown"),
         ):
-            _check_close(
-                failures,
-                f"{prefix} {column}",
-                metrics[metric],
-                row[column],
-                rtol=rtol,
-                atol=atol,
-            )
-        for metric, column in (
-            ("cagr", "index_cagr"),
-            ("sharpe_geometric", "index_sharpe"),
-        ):
-            _check_close(
-                failures,
-                f"{prefix} {column}",
-                benchmark_metrics[metric],
-                row[column],
-                rtol=rtol,
-                atol=atol,
-            )
+            _check_close(failures, f"{prefix} {column}", metrics[metric], row[column], rtol=rtol, atol=atol)
         if len(strategy) != int(row["n_days"]):
-            failures.append(
-                f"{prefix} n_days: computed {len(strategy)}, "
-                f"reported {int(row['n_days'])}"
-            )
+            failures.append(f"{prefix} n_days: computed {len(strategy)}, reported {int(row['n_days'])}")
         if strategy.index.min().date().isoformat() != str(row["first_date"]):
             failures.append(f"{prefix} first_date does not match daily evidence")
         if strategy.index.max().date().isoformat() != str(row["last_date"]):
             failures.append(f"{prefix} last_date does not match daily evidence")
 
-    assert daily is not None and manifest is not None
-    differences = pd.read_csv(
-        report_dir / "tape_return_differences_corrected.csv"
-    )
+        benchmark_col = columns.get(row["benchmark_return_column"])
+        if benchmark_col is None:
+            # SPY's daily returns are CRSP values and only exist locally
+            skipped += 2
+            continue
+        bench = _metrics_for(benchmark_col, cash_rate)
+        for metric, column in (("cagr", "index_cagr"), ("sharpe_geometric", "index_sharpe")):
+            _check_close(failures, f"{prefix} {column}", bench[metric], row[column], rtol=rtol, atol=atol)
+
+    differences = pd.read_csv(report_dir / "tape_return_differences_corrected.csv")
     if len(differences) != 1:
         raise ValueError("Tape return-difference report must contain one row.")
     gap_row = differences.iloc[0]
-    gap_required = {
-        "threshold_bps",
-        "strategy_days_compared",
-        "strategy_days_over_threshold",
-        "strategy_mean_abs_gap_bps",
-        "strategy_max_abs_gap_bps",
-        "strategy_daily_returns_path",
-        "legacy_strategy_return_column",
-        "v2_strategy_return_column",
-        "daily_returns_manifest_path",
-    }
-    missing = gap_required - set(differences.columns)
-    if missing:
-        raise ValueError(f"Tape gap report is missing evidence columns: {sorted(missing)}")
-    gap_daily, _ = _load_evidence(
-        report_dir,
-        str(gap_row["strategy_daily_returns_path"]),
-        str(gap_row["daily_returns_manifest_path"]),
-    )
-    paired = gap_daily[
+    for name in ("legacy_strategy_return_column", "v2_strategy_return_column"):
+        if str(gap_row[name]) not in columns:
+            raise ValueError(f"Tape gap series {gap_row[name]} is not in any evidence file.")
+    paired = pd.concat(
         [
-            str(gap_row["legacy_strategy_return_column"]),
-            str(gap_row["v2_strategy_return_column"]),
-        ]
-    ].dropna()
+            columns[str(gap_row["legacy_strategy_return_column"])].values,
+            columns[str(gap_row["v2_strategy_return_column"])].values,
+        ],
+        axis=1,
+    ).dropna()
     gaps = (paired.iloc[:, 1] - paired.iloc[:, 0]).abs() * 10_000.0
     threshold = float(gap_row["threshold_bps"])
-    exact_checks = {
-        "strategy_days_compared": len(gaps),
-        "strategy_days_over_threshold": int((gaps > threshold).sum()),
-    }
-    for column, computed in exact_checks.items():
+    for column, computed in (
+        ("strategy_days_compared", len(gaps)),
+        ("strategy_days_over_threshold", int((gaps > threshold).sum())),
+    ):
         if int(gap_row[column]) != computed:
-            failures.append(
-                f"tape gap {column}: computed {computed}, "
-                f"reported {int(gap_row[column])}"
-            )
+            failures.append(f"tape gap {column}: computed {computed}, reported {int(gap_row[column])}")
     for column, computed in (
         ("strategy_mean_abs_gap_bps", float(gaps.mean())),
         ("strategy_max_abs_gap_bps", float(gaps.max())),
     ):
-        _check_close(
-            failures,
-            f"tape gap {column}",
-            computed,
-            gap_row[column],
-            rtol=rtol,
-            atol=atol,
-        )
+        _check_close(failures, f"tape gap {column}", computed, gap_row[column], rtol=rtol, atol=atol)
     if failures:
         raise ValueError("Corrected tape verification failed:\n- " + "\n- ".join(failures))
-    return len(summary), len(exact_checks) + 2
+    return {"tape_rows": len(summary), "tape_fields_skipped": skipped, "strategy_gap_fields": 4}
 
 
 def _verify_control_report(
     report_dir: Path,
+    columns: dict[str, EvidenceColumn],
     *,
     rtol: float,
     atol: float,
-) -> int:
+) -> dict[str, int]:
     control = pd.read_csv(report_dir / "vol_managed_control_corrected.csv")
     required = {
-        "leg",
-        "variant",
-        "evaluation_start",
-        "evaluation_end",
-        "n_evaluation_days",
-        "cagr",
-        "annualized_vol",
-        "sharpe_geometric",
-        "sharpe_arithmetic",
-        "max_drawdown",
-        "daily_returns_path",
-        "daily_return_column",
-        "cash_return_column",
-        "daily_returns_manifest_path",
+        "leg", "variant", "evaluation_start", "evaluation_end", "n_evaluation_days", "cagr",
+        "annualized_vol", "sharpe_geometric", "sharpe_arithmetic", "max_drawdown",
+        "daily_return_column", "cash_return_column",
     }
     missing = required - set(control.columns)
     if missing:
-        raise ValueError(
-            f"Volatility-control report is missing evidence columns: {sorted(missing)}"
-        )
+        raise ValueError(f"Volatility-control report is missing evidence columns: {sorted(missing)}")
 
     failures: list[str] = []
-    referenced_columns: set[str] = set()
+    verified = skipped = 0
+    referenced: set[str] = set()
     for row in control.to_dict(orient="records"):
-        daily, manifest = _load_evidence(
-            report_dir,
-            row["daily_returns_path"],
-            row["daily_returns_manifest_path"],
-        )
-        return_column = row["daily_return_column"]
-        cash_column = row["cash_return_column"]
-        referenced_columns.add(return_column)
-        returns = daily[return_column].dropna()
-        cash = daily[cash_column].reindex(returns.index)
-        policy = manifest["metric_policy"]
-        metrics = compute_return_metrics(
-            returns,
-            cash_rate_annual=float(
-                policy["geometric_sharpe_cash_rate_annual"]
-            ),
-            periods_per_year=float(policy["periods_per_year"]),
-        )
+        prefix = f"control {row['leg']} {row['variant']}"
+        series = columns.get(row["daily_return_column"])
+        referenced.add(row["daily_return_column"])
+        if series is None:
+            if row["leg"] == "index":
+                # overlays on SPY's CRSP returns only exist in the local copy
+                skipped += 1
+                continue
+            raise ValueError(f"{prefix}: series {row['daily_return_column']} is not in any evidence file.")
+        cash = columns.get(row["cash_return_column"])
+        if cash is None:
+            raise ValueError(f"{prefix}: cash series {row['cash_return_column']} is missing.")
+        returns = series.values.dropna()
+        metrics = _metrics_for(series, float(series.policy["geometric_sharpe_cash_rate_annual"]))
         metrics["sharpe_arithmetic"] = compute_arithmetic_sharpe(
             returns,
-            cash,
-            periods_per_year=float(policy["periods_per_year"]),
+            cash.values.reindex(returns.index),
+            periods_per_year=float(series.policy.get("periods_per_year", PERIODS_PER_YEAR)),
         )
-        prefix = f"control {row['leg']} {row['variant']}"
-        for metric, column in (
-            ("cagr", "cagr"),
-            ("annualized_vol", "annualized_vol"),
-            ("sharpe_geometric", "sharpe_geometric"),
-            ("sharpe_arithmetic", "sharpe_arithmetic"),
-            ("max_drawdown", "max_drawdown"),
-        ):
-            _check_close(
-                failures,
-                f"{prefix} {column}",
-                metrics[metric],
-                row[column],
-                rtol=rtol,
-                atol=atol,
-            )
+        for metric in ("cagr", "annualized_vol", "sharpe_geometric", "sharpe_arithmetic", "max_drawdown"):
+            _check_close(failures, f"{prefix} {metric}", metrics[metric], row[metric], rtol=rtol, atol=atol)
         if len(returns) != int(row["n_evaluation_days"]):
             failures.append(
-                f"{prefix} n_evaluation_days: computed {len(returns)}, "
-                f"reported {int(row['n_evaluation_days'])}"
+                f"{prefix} n_evaluation_days: computed {len(returns)}, reported {int(row['n_evaluation_days'])}"
             )
         if returns.index.min().date().isoformat() != str(row["evaluation_start"]):
             failures.append(f"{prefix} evaluation_start does not match evidence")
         if returns.index.max().date().isoformat() != str(row["evaluation_end"]):
             failures.append(f"{prefix} evaluation_end does not match evidence")
+        verified += 1
 
-    expected_return_columns = {
-        column
-        for column in manifest["return_columns"]
-        if column != manifest["cash_return_column"]
-    }
-    if referenced_columns != expected_return_columns:
-        raise ValueError(
-            "Control report does not reference each committed portfolio-return "
-            "column exactly once."
-        )
+    # every portfolio series in a control evidence file must back some row
+    for name, entry in columns.items():
+        if entry.cash_column is None or name == entry.cash_column:
+            continue
+        if name not in referenced:
+            failures.append(f"evidence column {name} is not referenced by the control report")
     if failures:
-        raise ValueError(
-            "Corrected volatility-control verification failed:\n- "
-            + "\n- ".join(failures)
-        )
-    return len(control)
+        raise ValueError("Corrected volatility-control verification failed:\n- " + "\n- ".join(failures))
+    return {"control_rows": verified, "control_rows_skipped": skipped}
 
 
 def verify_corrected_reports(
     report_dir: Path = Path("reports"),
     *,
+    evidence_dirs: list[Path] | None = None,
     rtol: float = 1e-9,
     atol: float = 1e-12,
 ) -> dict[str, int]:
-    """Verify all corrected performance headlines against committed evidence."""
-    tape_rows, gap_fields = _verify_tape_reports(
-        report_dir, rtol=rtol, atol=atol
-    )
-    control_rows = _verify_control_report(report_dir, rtol=rtol, atol=atol)
+    """Verify all corrected performance headlines against available evidence."""
+    dirs = evidence_dirs if evidence_dirs is not None else [report_dir, LOCAL_EVIDENCE_DIR]
+    columns = load_evidence(dirs)
     return {
-        "tape_rows": tape_rows,
-        "control_rows": control_rows,
-        "strategy_gap_fields": gap_fields,
+        **_verify_tape_reports(report_dir, columns, rtol=rtol, atol=atol),
+        **_verify_control_report(report_dir, columns, rtol=rtol, atol=atol),
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report-dir", type=Path, default=Path("reports"))
+    parser.add_argument(
+        "--evidence-dir",
+        type=Path,
+        action="append",
+        help="evidence directory to read (repeatable); default reports/ and output/evidence/",
+    )
     parser.add_argument("--rtol", type=float, default=1e-9)
     parser.add_argument("--atol", type=float, default=1e-12)
     args = parser.parse_args()
     checked = verify_corrected_reports(
         args.report_dir,
+        evidence_dirs=args.evidence_dir,
         rtol=args.rtol,
         atol=args.atol,
     )
     print(
         "verified corrected report arithmetic: "
         f"{checked['tape_rows']} tape rows, "
-        f"{checked['control_rows']} control rows, "
-        f"{checked['strategy_gap_fields']} strategy-gap fields"
+        f"{checked['strategy_gap_fields']} strategy-gap fields, "
+        f"{checked['control_rows']} control rows; skipped "
+        f"{checked['tape_fields_skipped']} benchmark fields and "
+        f"{checked['control_rows_skipped']} index-leg rows that need the local "
+        f"evidence in {LOCAL_EVIDENCE_DIR}/"
     )
     return 0
 

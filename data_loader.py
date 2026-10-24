@@ -535,8 +535,8 @@ def _get_wrds_connection(
     """Open one authorized WRDS connection, without the client's login retries."""
     if os.environ.get("WRDS_DUO_READY") != "1":
         raise RuntimeError(
-            "WRDS is disabled. Obtain approval for the Duo push in this session, "
-            "then set WRDS_DUO_READY=1. Cached snapshots need no connection."
+            "WRDS is disabled. Set WRDS_DUO_READY=1 when you are ready to approve "
+            "the Duo push for this session. Cached snapshots need no connection."
         )
     try:
         import wrds  # type: ignore
@@ -579,7 +579,7 @@ def _get_wrds_connection(
         # Driver exceptions can contain connection details. Never repeat them.
         raise RuntimeError(
             "WRDS setup or connection failed; at most one attempt, no retry or prompt was "
-            "made. Obtain fresh approval before another attempt."
+            "made. Check credentials and Duo before trying again."
         ) from None
     return client
 

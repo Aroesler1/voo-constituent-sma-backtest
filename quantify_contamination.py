@@ -69,6 +69,20 @@ def _sma_signal(prices: pd.Series, window: int = 200) -> pd.Series:
     return (prices > sma).where(sma.notna())
 
 
+def _sma_signal_by_security(frame: pd.DataFrame, window: int = 200) -> pd.Series:
+    """The same signal, with every trailing window kept inside one PERMNO.
+
+    A ticker legitimately used by two securities in turn keeps both in the
+    clean panel; an average spanning the handover would mix two companies, so
+    each security's signal starts from its own history.
+    """
+    parts = [
+        _sma_signal(group.set_index("date")["adjusted_close"].astype(float), window)
+        for _, group in frame.groupby("permno", sort=False)
+    ]
+    return pd.concat(parts).sort_index() if parts else pd.Series(dtype=float)
+
+
 def analyse_ticker(path: Path, history: pd.DataFrame) -> dict | None:
     match = _TICKER_RE.match(path.name)
     if match is None:
@@ -90,7 +104,6 @@ def analyse_ticker(path: Path, history: pd.DataFrame) -> dict | None:
     clean = frame[keep]
 
     contaminated_px = frame.set_index("date")["adjusted_close"].astype(float)
-    clean_px = clean.set_index("date")["adjusted_close"].astype(float)
 
     # a return is fabricated when consecutive rows come from different PERMNOs
     permno = frame["permno"].to_numpy()
@@ -101,7 +114,7 @@ def analyse_ticker(path: Path, history: pd.DataFrame) -> dict | None:
 
     # signal disagreement on the dates both panels cover
     sig_c = _sma_signal(contaminated_px)
-    sig_k = _sma_signal(clean_px)
+    sig_k = _sma_signal_by_security(clean)
     common = sig_c.dropna().index.intersection(sig_k.dropna().index)
     disagree = int((sig_c.loc[common] != sig_k.loc[common]).sum()) if len(common) else 0
 

@@ -1,5 +1,12 @@
 # Schedule-frequency audit, 2026-09-06
 
+> Superseded figures. The numbers in this note come from the 2026-09-06 run. After the
+> 2026-10-23 rerun (see [the correction](audit_history.md#correction-2026-10-23-rerun-after-the-code-review))
+> the SMA-200 pooled range is 4.21 pp, the weekly-only and monthly-only ranges are 0.90 pp and
+> 1.89 pp, the between-frequency share is 71.7% (71.7% to 78.1% across lengths) and the
+> semi-monthly SMA-200 CAGR is 8.848%; five of the 135 anchor variants now end above the index
+> CAGR. The method and sources below are unchanged.
+
 ## Scope and question
 
 The committed study covers 7,300 trading days from 1996-01-02 to 2024-12-31,

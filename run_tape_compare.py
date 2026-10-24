@@ -37,6 +37,7 @@ from crsp_v2 import (
     fetch_constituent_prices_v2,
     largest_return_differences,
     load_verified_terminal_outcomes,
+    terminal_outcomes_from_corrected_cache,
 )
 from metrics import compute_metrics
 from panel import BacktestPanel, build_panel
@@ -44,9 +45,9 @@ from preprocessing import build_rebalance_calendar
 from report_evidence import (
     TAPE_DAILY_NAME,
     TAPE_MANIFEST_NAME,
-    committed_report_path,
-    write_daily_evidence,
-    write_manifest,
+    TAPE_PUBLIC_MANIFEST_NAME,
+    TAPE_PUBLIC_NAME,
+    write_evidence,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -181,20 +182,35 @@ def main() -> None:
     out_dir = Path(config.OUTPUT_DIR)
     if config.END_DATE != "2024-12-31":
         raise ValueError("Tape comparison requires the pinned END_DATE=2024-12-31.")
-    if not config.CIZ_TERMINAL_RETURNS_PATH or not config.CIZ_TERMINAL_METADATA_PATH:
-        raise ValueError(
-            "Tape comparison requires a verified CIZ terminal-return extract and sidecar."
+    if config.CIZ_TERMINAL_RETURNS_PATH and config.CIZ_TERMINAL_METADATA_PATH:
+        terminal_outcomes, terminal_metadata = load_verified_terminal_outcomes(
+            config.CIZ_TERMINAL_RETURNS_PATH,
+            config.CIZ_TERMINAL_METADATA_PATH,
         )
-    terminal_outcomes, terminal_metadata = load_verified_terminal_outcomes(
-        config.CIZ_TERMINAL_RETURNS_PATH,
-        config.CIZ_TERMINAL_METADATA_PATH,
-    )
-    LOGGER.info(
-        "Verified CIZ terminal source: product=%s table=%s semantics=%s",
-        terminal_metadata["source_product"],
-        terminal_metadata["source_table"],
-        terminal_metadata["return_semantics"],
-    )
+        terminal_source_label = f"extract:{terminal_metadata['extract_sha256'][:12]}"
+        LOGGER.info(
+            "Verified CIZ terminal source: product=%s table=%s semantics=%s",
+            terminal_metadata["source_product"],
+            terminal_metadata["source_table"],
+            terminal_metadata["return_semantics"],
+        )
+    elif config.CIZ_CORRECTED_CACHE_VERSION:
+        # offline rerun from caches a verified extract already corrected; the
+        # terminal events travel with those caches
+        terminal_outcomes = terminal_outcomes_from_corrected_cache(
+            config, config.START_DATE, config.END_DATE
+        )
+        terminal_source_label = f"corrected_cache:{config.CIZ_CORRECTED_CACHE_VERSION}"
+        LOGGER.info(
+            "CIZ terminal events from corrected cache %s: %s events",
+            config.CIZ_CORRECTED_CACHE_VERSION,
+            len(terminal_outcomes),
+        )
+    else:
+        raise ValueError(
+            "Tape comparison requires a verified CIZ terminal-return extract and sidecar, "
+            "or CIZ_CORRECTED_CACHE_VERSION naming caches corrected with one."
+        )
 
     LOGGER.info("Building legacy (crsp.dsf) panel.")
     legacy = build_panel(config)
@@ -338,12 +354,6 @@ def main() -> None:
     daily.index.name = "date"
     daily = daily.reset_index()
     daily["date"] = pd.to_datetime(daily["date"]).dt.strftime("%Y-%m-%d")
-    artifact = write_daily_evidence(
-        daily,
-        output_dir=out_dir,
-        report_dir=REPORTS_DIR,
-        name=TAPE_DAILY_NAME,
-    )
     source_labels = {
         "legacy_strategy_return": {
             "source_label": "legacy_dsf:constituent_sma200:semi_monthly",
@@ -351,9 +361,9 @@ def main() -> None:
             "portfolio": "constituent_sma200_semi_monthly",
         },
         "legacy_benchmark_return": {
-            "source_label": "legacy_dsf:sp500_total_return:buy_and_hold",
+            "source_label": "legacy_dsf:spy_total_return:buy_and_hold",
             "tape": "legacy_dsf",
-            "portfolio": "sp500_total_return_buy_and_hold",
+            "portfolio": "spy_total_return_buy_and_hold",
         },
         "v2_strategy_return": {
             "source_label": "v2_ciz:constituent_sma200:semi_monthly",
@@ -361,38 +371,48 @@ def main() -> None:
             "portfolio": "constituent_sma200_semi_monthly",
         },
         "v2_benchmark_return": {
-            "source_label": "v2_ciz:sp500_total_return:buy_and_hold",
+            "source_label": "v2_ciz:spy_total_return:buy_and_hold",
             "tape": "v2_ciz",
-            "portfolio": "sp500_total_return_buy_and_hold",
+            "portfolio": "spy_total_return_buy_and_hold",
         },
     }
-    write_manifest(
-        {
-            **artifact,
-            "schema_version": 1,
-            "content": "portfolio-level daily simple returns only",
-            "date_column": "date",
-            "return_columns": source_labels,
-            "metric_policy": {
-                "periods_per_year": 252.0,
-                "geometric_sharpe_cash_rate_annual": {
-                    "legacy_dsf": legacy_head["cash_rate_annual"],
-                    "v2_ciz": v2_head["cash_rate_annual"],
-                },
-                "strategy_gap_threshold_bps": float(args.threshold_bps),
+    manifest_fields = {
+        "schema_version": 2,
+        "content": "portfolio-level daily simple returns",
+        "date_column": "date",
+        "ciz_terminal_source": terminal_source_label,
+        "metric_policy": {
+            "periods_per_year": 252.0,
+            "first_row_is_start": True,
+            "geometric_sharpe_cash_rate_annual": {
+                "legacy_dsf": legacy_head["cash_rate_annual"],
+                "v2_ciz": v2_head["cash_rate_annual"],
             },
+            "strategy_gap_threshold_bps": float(args.threshold_bps),
         },
-        output_dir=out_dir,
-        report_dir=REPORTS_DIR,
-        name=TAPE_MANIFEST_NAME,
+    }
+    # full copy, with SPY's CRSP returns, stays local; the committed copy
+    # holds only the two constituent-strategy series
+    write_evidence(
+        daily,
+        directory=Path(config.OUTPUT_DIR) / "evidence",
+        name=TAPE_DAILY_NAME,
+        manifest_name=TAPE_MANIFEST_NAME,
+        return_columns=source_labels,
+        manifest_fields=manifest_fields,
+    )
+    write_evidence(
+        daily,
+        directory=REPORTS_DIR,
+        name=TAPE_PUBLIC_NAME,
+        manifest_name=TAPE_PUBLIC_MANIFEST_NAME,
+        return_columns=source_labels,
+        manifest_fields=manifest_fields,
+        columns=["legacy_strategy_return", "v2_strategy_return"],
     )
 
-    daily_path = committed_report_path(TAPE_DAILY_NAME)
-    manifest_path = committed_report_path(TAPE_MANIFEST_NAME)
-    diff["strategy_daily_returns_path"] = daily_path
     diff["legacy_strategy_return_column"] = "legacy_strategy_return"
     diff["v2_strategy_return_column"] = "v2_strategy_return"
-    diff["daily_returns_manifest_path"] = manifest_path
     # The constituent-only evidence was persisted before either strategy ran.
     # Refresh this aggregate report now that strategy-level evidence is known.
     _write_table(pd.DataFrame([diff]), out_dir, "tape_return_differences.csv")
@@ -407,21 +427,18 @@ def main() -> None:
             for row in (legacy_head, v2_head)
         ]
     )
-    summary["strategy_daily_returns_path"] = daily_path
     summary["strategy_return_column"] = summary["tape"].map(
         {
             "legacy_dsf": "legacy_strategy_return",
             "v2_ciz": "v2_strategy_return",
         }
     )
-    summary["benchmark_daily_returns_path"] = daily_path
     summary["benchmark_return_column"] = summary["tape"].map(
         {
             "legacy_dsf": "legacy_benchmark_return",
             "v2_ciz": "v2_benchmark_return",
         }
     )
-    summary["daily_returns_manifest_path"] = manifest_path
     _write_table(summary, out_dir, "tape_comparison.csv")
 
     LOGGER.info("Headline on both tapes:\n%s", summary.to_string(index=False))

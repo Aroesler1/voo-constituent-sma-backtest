@@ -233,6 +233,7 @@ def compute_daily_liquidity_feature_matrices(
     vol_lookback: int,
     spread_model: str,
     open_df: pd.DataFrame | None = None,
+    dollar_volume_df: pd.DataFrame | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Compute daily liquidity feature matrices for multi-asset cost modeling.
 
@@ -241,6 +242,10 @@ def compute_daily_liquidity_feature_matrices(
         estimator from OHLC; unbiased with overnight returns and more
         efficient than high-low estimators. Requires ``open_df``.
       - ``corwin_schultz``: legacy high-low estimator, kept for comparison.
+
+    ``dollar_volume_df`` should be traded price times traded volume. When it is
+    omitted, ADV falls back to ``price_df * volume_df``, which is only right if
+    both are on the same split basis; a total-return price level is not.
     """
     common_cols = sorted(set(price_df.columns) & set(volume_df.columns) & set(high_df.columns) & set(low_df.columns))
     if not common_cols:
@@ -251,7 +256,11 @@ def compute_daily_liquidity_feature_matrices(
     hi = high_df[common_cols].astype(FLOAT_DTYPE)
     lo = low_df[common_cols].astype(FLOAT_DTYPE)
 
-    adv_usd = (px * vol).rolling(adv_lookback).mean().astype(FLOAT_DTYPE)
+    if dollar_volume_df is not None:
+        dollar_volume = dollar_volume_df.reindex(index=px.index, columns=common_cols).astype(FLOAT_DTYPE)
+    else:
+        dollar_volume = px * vol
+    adv_usd = dollar_volume.rolling(adv_lookback).mean().astype(FLOAT_DTYPE)
     sigma_20d = np.log(px / px.shift(1)).rolling(vol_lookback).std().astype(FLOAT_DTYPE)
 
     model = spread_model.lower()
@@ -299,15 +308,10 @@ def _build_membership_from_events(
     )
     pivot = pivot.sort_index()
 
-    start = pd.Timestamp(trading_index.min())
-    initial = pivot.loc[pivot.index < start].sum(axis=0) if not pivot.empty else pd.Series(dtype=float)
-    flow = pivot.loc[pivot.index >= start].reindex(trading_index, fill_value=0)
-
-    states = flow.cumsum()
-    if len(initial) > 0:
-        initial_aligned = initial.reindex(states.columns).fillna(0.0)
-        states = states + initial_aligned
-
+    # cumulate events in calendar order, then sample the running state on each
+    # trading day. reindexing the events themselves onto trading days silently
+    # dropped any add or remove dated on a weekend or market holiday
+    states = pivot.cumsum().reindex(pd.DatetimeIndex(trading_index), method="ffill").fillna(0)
     return states > 0
 
 

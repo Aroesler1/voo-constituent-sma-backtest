@@ -15,10 +15,10 @@ import numpy as np
 import pandas as pd
 
 from backtest_engine import run_buy_and_hold, run_constituent_backtest
-from config import config_hash, get_periods, load_config
+from config import config_hash, get_periods, load_config, public_config_dict
 from data_loader import build_snapshot_manifest_row
 from metrics import compute_drawdown_series, compute_metrics, compute_rolling_sharpe
-from panel import build_panel, snapshot_row
+from panel import active_mask_for_length, build_panel, snapshot_row
 from preprocessing import build_rebalance_calendar, estimate_proxy_fidelity
 from reporting import (
     plot_active_breadth,
@@ -39,7 +39,6 @@ from statistics_mt import (
     probability_of_backtest_overfitting,
     romano_wolf_stepdown,
 )
-from strategy import compute_sma_matrix, generate_active_mask
 
 LOGGER = logging.getLogger(__name__)
 
@@ -300,6 +299,29 @@ def _proxy_regime_deltas(
 
 
 
+#: aggregate tables copied to the tracked reports/ directory; none holds a
+#: CRSP record, only metrics computed from the backtest
+TRACKED_AGGREGATES = (
+    "results_summary.csv",
+    "schedule_comparison.csv",
+    "sma_sweep.csv",
+    "pbo_sweep.csv",
+    "romano_wolf_sweep.csv",
+)
+
+
+def publish_aggregates(output_dir: Path, report_dir: Path) -> list[str]:
+    """Copy the headline aggregate tables from output/ to reports/."""
+    report_dir.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for name in TRACKED_AGGREGATES:
+        source = output_dir / name
+        if source.exists():
+            (report_dir / name).write_bytes(source.read_bytes())
+            copied.append(name)
+    return copied
+
+
 def main() -> None:
     """Run full constituent-level institutional backtest workflow."""
     started = time.perf_counter()
@@ -461,14 +483,8 @@ def main() -> None:
     sweep_excess_returns: list[pd.Series] = []
     for sma_len in config.SMA_SWEEP_VALUES:
         LOGGER.info("Running SMA sweep length: %s", sma_len)
-        sma_i = compute_sma_matrix(close_df, int(sma_len))
-        active_i = generate_active_mask(
-            prices=close_df,
-            sma=sma_i,
-            signal_type=config.SIGNAL_TYPE,
-            entry_band_bps=config.ENTRY_BAND_BPS,
-            exit_band_bps=config.EXIT_BAND_BPS,
-        )
+        # the average is computed on pre-sample history, like the default mask
+        active_i = active_mask_for_length(panel, int(sma_len), config)
         res_i = run_constituent_backtest(
             price_df=close_df,
             return_df=close_returns,
@@ -502,7 +518,6 @@ def main() -> None:
                 "annual_turnover": met_i["annual_turnover"],
             }
         )
-        del sma_i
         del active_i
         del res_i
         gc.collect()
@@ -722,11 +737,8 @@ def main() -> None:
     manifest = {
         "run_timestamp_utc": pd.Timestamp.utcnow().isoformat(),
         "config_hash": config_hash(config),
-        "config": {
-            k: v
-            for k, v in vars(config).items()
-            if k not in {"FRED_API_KEY"}
-        },
+        # credentials stay out of the manifest, not just the FRED key
+        "config": public_config_dict(config),
         "package_versions": _package_versions(),
         "snapshots": snapshot_rows,
         "strategy_mode": config.STRATEGY_MODE,
@@ -752,6 +764,8 @@ def main() -> None:
 
     with (output_dir / "run_manifest.json").open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, sort_keys=True, default=str)
+
+    publish_aggregates(output_dir, Path("reports"))
 
     elapsed = time.perf_counter() - started
     LOGGER.info("Pipeline complete in %.2f seconds.", elapsed)

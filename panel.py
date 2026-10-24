@@ -16,6 +16,7 @@ from __future__ import annotations
 import gc
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
@@ -23,6 +24,7 @@ import pandas as pd
 
 from config import BacktestConfig
 from data_loader import (
+    CRSP_COMMON_SHARE_CODES,
     build_snapshot_manifest_row,
     fetch_crsp_batch_prices,
     fetch_fred_cash_rate,
@@ -32,6 +34,11 @@ from data_loader import (
 from preprocessing import (
     build_point_in_time_constituent_universe,
     compute_daily_liquidity_feature_matrices,
+)
+from permno_resolution import (
+    membership_intervals,
+    normalise_name_history,
+    resolve_membership_intervals,
 )
 from strategy import compute_sma_matrix, generate_active_mask
 
@@ -61,6 +68,13 @@ class BacktestPanel:
     permno_df: pd.DataFrame
     terminal_mask: pd.DataFrame
     terminal_applied_mask: pd.DataFrame
+    # every SPY session from START_DATE, so signals can use pre-sample prices
+    history_index: pd.DatetimeIndex = field(default_factory=pd.DatetimeIndex)
+    # total-return close on history_index; the SMA is computed on this and then
+    # trimmed to trading_index, so the sample does not open with a cash warm-up
+    history_close_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # PERMNO resolution of each membership interval (empty when no name history)
+    membership_resolution: pd.DataFrame = field(default_factory=pd.DataFrame)
     constituentsnapshot_rows: list[dict[str, Any]] = field(default_factory=list)
     voo_daily: pd.DataFrame = field(default_factory=pd.DataFrame)
     spy_daily: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -89,9 +103,11 @@ def _extract_crsp_total_return_close(d: pd.DataFrame) -> pd.Series:
     a full run spent roughly three quarters of an hour inside this function
     alone. The cumulative product is now computed per segment with groupby.
 
-    A segment break is a PERMNO change or a gap of more than seven days. Both
-    reset the compounding, because a price path may not be carried across two
-    different securities or across a listing gap.
+    A segment break is a PERMNO change: a price path may not be carried across
+    two different securities. A gap in trading for the same PERMNO does not
+    break the path, because CRSP's return on the first day back already spans
+    the gap; restarting at the raw price there created a fake jump whenever the
+    raw price and the total-return level had drifted apart (splits, dividends).
     """
     raw_close = pd.to_numeric(d["close"], errors="coerce").abs()
     total_return = pd.to_numeric(d.get("total_return"), errors="coerce")
@@ -100,12 +116,12 @@ def _extract_crsp_total_return_close(d: pd.DataFrame) -> pd.Series:
     else:
         permno = pd.Series(np.nan, index=d.index)
 
-    gap_days = d.index.to_series().diff().dt.days
-    # first row is always a break; a permno change or a >7d gap resets the path
-    segment_break = (
-        gap_days.isna()
-        | (gap_days > 7)
-        | ((permno != permno.shift()) & permno.notna() & permno.shift().notna())
+    first_row = pd.Series(False, index=d.index)
+    if len(first_row):
+        first_row.iloc[0] = True
+    # first row is always a break; only a permno change resets the path
+    segment_break = first_row | (
+        (permno != permno.shift()) & permno.notna() & permno.shift().notna()
     )
     segment = segment_break.cumsum()
 
@@ -588,12 +604,19 @@ def _build_extended_voo_proxy(
     """Build a total-return proxy that uses SPY pre-inception and VOO thereafter."""
     inception = pd.Timestamp(voo_inception)
     spy = spy_close.sort_index().astype(float)
-    voo = voo_close.sort_index().astype(float)
+    # cut VOO at inception BEFORE taking returns: CRSP reuses the ticker, and
+    # the 1998-2003 rows belong to an unrelated company, so a return computed
+    # across the cut spliced the two securities
+    voo = voo_close.sort_index().astype(float).loc[lambda x: x.index >= inception].dropna()
+    # switch at the later of inception and VOO's first priced day, so the
+    # proxy never sits flat between the two
+    switch = max(inception, voo.index.min()) if len(voo) else pd.Timestamp.max
+    voo_ret = voo.pct_change(fill_method=None).loc[voo.index > switch]
 
     combined_ret = pd.concat(
         [
-            spy.pct_change(fill_method=None).loc[spy.index < inception],
-            voo.pct_change(fill_method=None).loc[voo.index >= inception],
+            spy.pct_change(fill_method=None).loc[spy.index <= switch],
+            voo_ret,
         ],
         axis=0,
     ).sort_index()
@@ -602,6 +625,115 @@ def _build_extended_voo_proxy(
     tri = (1.0 + combined_ret).cumprod()
     tri.name = "voo_proxy_total_return_index"
     return tri
+
+def load_name_history(path: str) -> pd.DataFrame:
+    """Read a CRSP name-history extract (crsp.dsenames columns) from disk."""
+    source = Path(path)
+    frame = pd.read_csv(source) if source.suffix.lower() == ".csv" else pd.read_parquet(source)
+    return normalise_name_history(frame)
+
+
+def assemble_member_prices(
+    prices: dict[str, pd.DataFrame],
+    resolution: pd.DataFrame,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """Rebuild each member's price frame from the PERMNOs it resolved to.
+
+    ``prices`` holds the frames the CRSP loader returned per requested ticker;
+    together they form a pool of (PERMNO, date) rows. A member whose interval
+    resolved only to its own ticker keeps its frame unchanged. Any other member
+    is rebuilt from the pool: each resolved stretch contributes its PERMNO's
+    rows up to the stretch end, starting where the previous stretch ended, so
+    the rows before a member joins still provide signal history.
+
+    Returns the rebuilt mapping (member tickers only) and a per-member report.
+    """
+    def _keeps_own_frame(ticker: str, segs: pd.DataFrame) -> bool:
+        resolved = segs.dropna(subset=["permno"])
+        return (
+            not resolved.empty
+            and resolved["method"].eq("direct").all()
+            and resolved["crsp_ticker"].eq(ticker).all()
+            and ticker in prices
+        )
+
+    # only rows of PERMNOs some member must be rebuilt from enter the pool
+    needed = {
+        int(p)
+        for ticker, segs in resolution.groupby("ticker")
+        if not _keeps_own_frame(ticker, segs)
+        for p in segs["permno"].dropna()
+    }
+    frames = []
+    for ticker, df in prices.items():
+        if df is None or df.empty or "permno" not in df.columns:
+            continue
+        ids = pd.to_numeric(df["permno"], errors="coerce")
+        hit = df[ids.isin(needed)]
+        if not hit.empty:
+            frames.append(hit.assign(_source_ticker=ticker))
+    pool = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["date", "permno"])
+    pool["date"] = pd.to_datetime(pool["date"])
+    pool["permno"] = pd.to_numeric(pool["permno"], errors="coerce")
+    pool = pool.dropna(subset=["permno"]).drop_duplicates(subset=["permno", "date"], keep="first")
+    by_permno = {int(p): g for p, g in pool.groupby("permno")}
+
+    out: dict[str, pd.DataFrame] = {}
+    report_rows = []
+    for ticker, segs in resolution.groupby("ticker", sort=True):
+        resolved = segs.dropna(subset=["permno"]).sort_values("start")
+        unresolved_days = int(
+            sum(len(pd.bdate_range(r.start, r.end)) for r in segs[segs["permno"].isna()].itertuples())
+        )
+        if _keeps_own_frame(ticker, segs):
+            out[ticker] = prices[ticker]
+            report_rows.append({"ticker": ticker, "methods": "direct", "rebuilt": False,
+                                "unresolved_member_days": unresolved_days, "missing_stretches": 0})
+            continue
+        pieces = []
+        missing = 0
+        lower = pd.Timestamp.min
+        for k, seg in enumerate(resolved.itertuples(index=False)):
+            upper = pd.Timestamp.max if k == len(resolved) - 1 else pd.Timestamp(seg.end)
+            rows = by_permno.get(int(seg.permno))
+            piece = None if rows is None else rows[(rows["date"] > lower) & (rows["date"] <= upper)]
+            in_member = None if rows is None else rows[(rows["date"] >= seg.start) & (rows["date"] <= seg.end)]
+            if in_member is None or in_member.empty:
+                missing += 1
+            if piece is not None and not piece.empty:
+                pieces.append(piece)
+            lower = pd.Timestamp(seg.end)
+        if pieces:
+            frame = pd.concat(pieces, ignore_index=True).sort_values("date")
+            frame = frame.drop_duplicates(subset=["date"], keep="last")
+            out[ticker] = frame.drop(columns="_source_ticker").reset_index(drop=True)
+        report_rows.append({
+            "ticker": ticker,
+            "methods": "+".join(sorted(set(resolved["method"]))) or "unresolved",
+            "rebuilt": True,
+            "unresolved_member_days": unresolved_days,
+            "missing_stretches": missing,
+        })
+    return out, pd.DataFrame(report_rows)
+
+
+def active_mask_for_length(panel: BacktestPanel, length: int, config: BacktestConfig) -> pd.DataFrame:
+    """Signal mask for one SMA length, computed on the pre-sample history.
+
+    The moving average uses every price from ``config.START_DATE``, so on the
+    first sample day it is already defined; only the trimmed mask is returned.
+    """
+    sma = compute_sma_matrix(panel.history_close_df, int(length))
+    active = generate_active_mask(
+        prices=panel.history_close_df,
+        sma=sma,
+        signal_type=config.SIGNAL_TYPE,
+        entry_band_bps=config.ENTRY_BAND_BPS,
+        exit_band_bps=config.EXIT_BAND_BPS,
+    )
+    del sma
+    return active.reindex(panel.trading_index)
+
 
 def build_panel(
     config: BacktestConfig,
@@ -643,14 +775,20 @@ def build_panel(
     spy_close = extract_adjusted_series(spy_daily, "close").sort_index()
 
     strategy_start = max(pd.Timestamp(spy_close.index.min()), _first_universe_date(sp500_events))
-    trading_index = pd.DatetimeIndex(spy_close.loc[spy_close.index >= strategy_start].index).sort_values().unique()
+    # the history calendar runs from START_DATE; the trading calendar starts with
+    # the membership file. signals and liquidity features are computed on the
+    # history calendar, so the sample opens with a defined 200-day average
+    # instead of ~200 sessions of forced cash while the benchmark is invested
+    history_index = pd.DatetimeIndex(spy_close.index).sort_values().unique()
+    trading_index = history_index[history_index >= strategy_start]
     extended_voo_proxy = _build_extended_voo_proxy(spy_close, voo_close, config.VOO_INCEPTION)
 
     LOGGER.info(
-        "Strategy trading calendar: %s..%s (%s days)",
+        "Strategy trading calendar: %s..%s (%s days); signal history from %s",
         trading_index.min().date().isoformat(),
         trading_index.max().date().isoformat(),
         len(trading_index),
+        history_index.min().date().isoformat(),
     )
 
     # 3) Build PIT universe matrix
@@ -670,14 +808,54 @@ def build_panel(
     }
     LOGGER.info("Universe symbols identified: %s", len(universe_tickers))
 
+    # 3b) Resolve each membership interval to a PERMNO when a name history is
+    # available, and request the tickers those securities traded under then
+    resolution = pd.DataFrame()
+    request_tickers = universe_tickers
+    if config.CRSP_NAMES_PATH:
+        names = load_name_history(config.CRSP_NAMES_PATH)
+        intervals = membership_intervals(membership)
+        # the same share codes the CRSP loader admits for constituents
+        resolution = resolve_membership_intervals(
+            intervals, names, share_codes=CRSP_COMMON_SHARE_CODES
+        )
+        extra = set(resolution["crsp_ticker"].dropna()) - {""}
+        request_tickers = sorted(set(universe_tickers) | {_normalize_ticker(t) for t in extra})
+        LOGGER.info(
+            "Membership resolution: %s",
+            resolution["method"].value_counts().to_dict(),
+        )
+    else:
+        LOGGER.warning(
+            "CRSP_NAMES_PATH is not set: members are matched on the ticker CRSP "
+            "carried that day, so renamed and dual-class members can be missing."
+        )
+
     # 4) Fetch constituent prices
     constituent_prices, constituent_source_map = constituent_fetcher(
-        tickers=universe_tickers,
+        tickers=request_tickers,
         start=config.START_DATE,
         end=config.END_DATE,
         config=config,
         current_tickers=current_tickers,
     )
+    if not resolution.empty:
+        assembled, assembly_report = assemble_member_prices(constituent_prices, resolution)
+        for ticker in universe_tickers:
+            if ticker not in assembled and ticker in constituent_prices and ticker not in set(resolution["ticker"]):
+                assembled[ticker] = constituent_prices[ticker]
+        constituent_source_map = {
+            t: constituent_source_map.get(t, config.PRIMARY_PRICE_SOURCE) for t in assembled
+        }
+        constituent_prices = assembled
+        resolution.attrs["assembly_report"] = assembly_report
+        LOGGER.info(
+            "Rebuilt %s member price histories from resolved PERMNOs; %s member stretches "
+            "had no cached rows.",
+            int(assembly_report["rebuilt"].sum()),
+            int(assembly_report["missing_stretches"].sum()),
+        )
+    constituent_prices = {t: df for t, df in constituent_prices.items() if t in set(universe_tickers)}
 
     fetched_tickers = sorted(set(constituent_prices.keys()))
     if not fetched_tickers:
@@ -694,12 +872,18 @@ def build_panel(
         for ticker, df in sorted(constituent_prices.items())
     ]
 
-    # 5) Build aligned matrices
-    close_df = _build_matrix(constituent_prices, fetched_tickers, trading_index, "close")
-    open_df = _build_matrix(constituent_prices, fetched_tickers, trading_index, "open")
-    high_df = _build_matrix(constituent_prices, fetched_tickers, trading_index, "high")
-    low_df = _build_matrix(constituent_prices, fetched_tickers, trading_index, "low")
-    volume_df = _build_matrix(constituent_prices, fetched_tickers, trading_index, "volume")
+    # 5) Build aligned matrices on the history calendar
+    close_hist = _build_matrix(constituent_prices, fetched_tickers, history_index, "close")
+    open_hist = _build_matrix(constituent_prices, fetched_tickers, history_index, "open")
+    high_hist = _build_matrix(constituent_prices, fetched_tickers, history_index, "high")
+    low_hist = _build_matrix(constituent_prices, fetched_tickers, history_index, "low")
+    volume_hist = _build_matrix(constituent_prices, fetched_tickers, history_index, "volume")
+    # raw CRSP |prc| for the $5 filter, and split-consistent dollar volume:
+    # adjusted close x split-adjusted volume equals raw price x raw volume
+    raw_close_hist = _build_raw_field_matrix(constituent_prices, fetched_tickers, history_index, "close")
+    adj_close_hist = _build_raw_field_matrix(
+        constituent_prices, fetched_tickers, history_index, "adjusted_close"
+    )
     close_returns = _build_return_matrix(constituent_prices, fetched_tickers, trading_index)
     permno_df = _build_raw_field_matrix(
         constituent_prices, fetched_tickers, trading_index, "permno"
@@ -712,17 +896,22 @@ def build_panel(
     ).fillna(0.0).astype(bool)
     del constituent_prices
 
-    # Restrict universe to tickers with any usable pricing history.
-    valid_cols = [c for c in fetched_tickers if close_df[c].notna().any()]
-    close_df = close_df[valid_cols]
-    open_df = open_df[valid_cols]
-    high_df = high_df[valid_cols]
-    low_df = low_df[valid_cols]
-    volume_df = volume_df[valid_cols]
+    # Restrict universe to tickers with any usable pricing history in the sample.
+    in_sample = close_hist.loc[trading_index]
+    valid_cols = [c for c in fetched_tickers if in_sample[c].notna().any()]
+    del in_sample
+    close_hist = close_hist[valid_cols]
+    open_hist = open_hist[valid_cols]
+    high_hist = high_hist[valid_cols]
+    low_hist = low_hist[valid_cols]
+    volume_hist = volume_hist[valid_cols]
+    raw_close_hist = raw_close_hist[valid_cols]
+    dollar_volume_hist = (adj_close_hist[valid_cols] * volume_hist).astype(np.float32)
+    del adj_close_hist
     permno_df = permno_df[valid_cols]
     terminal_mask = terminal_mask[valid_cols]
     terminal_applied_mask = terminal_applied_mask[valid_cols]
-    open_df = _sanitize_open_matrix(open_df, high_df, low_df, close_df).astype(np.float32)
+    open_hist = _sanitize_open_matrix(open_hist, high_hist, low_hist, close_hist).astype(np.float32)
 
     membership = membership.reindex(columns=valid_cols, fill_value=False)
     base_weights = membership.attrs.get(
@@ -733,6 +922,7 @@ def build_panel(
     source_by_date = membership.attrs.get("source_by_date", pd.Series("unknown", index=trading_index, dtype=object))
     membership.attrs = {}
 
+    close_df = close_hist.loc[trading_index].copy()
     coverage_ratio = (
         (membership & close_df.notna()).sum(axis=1) / membership.sum(axis=1).replace(0, np.nan)
     ).fillna(0.0)
@@ -751,19 +941,23 @@ def build_panel(
     LOGGER.info("Building daily liquidity features.")
 
     liq = compute_daily_liquidity_feature_matrices(
-        price_df=close_df,
-        volume_df=volume_df,
-        high_df=high_df,
-        low_df=low_df,
+        price_df=close_hist,
+        volume_df=volume_hist,
+        high_df=high_hist,
+        low_df=low_hist,
         adv_lookback=config.ADV_LOOKBACK_DAYS,
         vol_lookback=config.VOL_LOOKBACK_DAYS,
         spread_model=config.SPREAD_MODEL,
-        open_df=open_df,
+        open_df=open_hist,
+        dollar_volume_df=dollar_volume_hist,
     )
+    liq = {name: frame.reindex(trading_index) for name, frame in liq.items()}
+    raw_close_df = raw_close_hist.loc[trading_index].astype(np.float32)
+    open_df = open_hist.loc[trading_index]
 
     tradable_sanity_mask = membership.reindex(index=trading_index, columns=valid_cols).fillna(False)
     if config.ENFORCE_INVESTABILITY_FILTER:
-        tradable_sanity_mask &= close_df.ge(float(config.MIN_PRICE_TO_TRADE))
+        tradable_sanity_mask &= raw_close_df.ge(float(config.MIN_PRICE_TO_TRADE))
         tradable_sanity_mask &= liq["adv_usd"].fillna(0.0).ge(float(config.MIN_ADV_USD_TO_TRADE))
     _log_return_sanity(close_returns, tradable_sanity_mask)
 
@@ -771,24 +965,27 @@ def build_panel(
     close_df.attrs["adv_usd"] = liq["adv_usd"]
     close_df.attrs["sigma_20d"] = liq["sigma_20d"]
     close_df.attrs["spread_bps_est"] = liq["spread_bps_est"]
+    close_df.attrs["raw_close"] = raw_close_df
 
     del liq
-    del high_df
-    del low_df
-    del volume_df
-    del open_df
+    del high_hist
+    del low_hist
+    del volume_hist
+    del dollar_volume_hist
+    del open_hist
+    del raw_close_hist
     gc.collect()
 
-    LOGGER.info("Computing default SMA matrix.")
-    sma = compute_sma_matrix(close_df, int(sma_length))
+    LOGGER.info("Computing default SMA matrix on the signal history.")
+    sma = compute_sma_matrix(close_hist, int(sma_length))
     LOGGER.info("Generating default active mask.")
     active_mask = generate_active_mask(
-        prices=close_df,
+        prices=close_hist,
         sma=sma,
         signal_type=config.SIGNAL_TYPE,
         entry_band_bps=config.ENTRY_BAND_BPS,
         exit_band_bps=config.EXIT_BAND_BPS,
-    )
+    ).reindex(trading_index)
     del sma
     gc.collect()
 
@@ -816,6 +1013,9 @@ def build_panel(
         permno_df=permno_df,
         terminal_mask=terminal_mask,
         terminal_applied_mask=terminal_applied_mask,
+        history_index=history_index,
+        history_close_df=close_hist,
+        membership_resolution=resolution,
         constituentsnapshot_rows=constituentsnapshot_rows,
         voo_daily=voo_daily,
         spy_daily=spy_daily,

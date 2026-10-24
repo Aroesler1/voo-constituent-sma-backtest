@@ -39,10 +39,17 @@ class BacktestConfig:
     # leaving WRDS_DUO_READY unset: unresolved tickers are returned as missing
     # before any connection helper or vendor import can run.
     OFFLINE_MODE: bool = False
-    # A verified terminal-outcome extract and its provenance sidecar are
-    # supplied after the approved metadata query. They remain outside Git.
+    # A verified terminal-outcome extract and its provenance sidecar come
+    # from a one-off WRDS metadata query. They remain outside Git.
     CIZ_TERMINAL_RETURNS_PATH: str | None = None
     CIZ_TERMINAL_METADATA_PATH: str | None = None
+    # Offline reuse of CIZ caches already corrected with that extract, named
+    # terminal-v3-<first 12 hex of the extract SHA-256>; read-only.
+    CIZ_CORRECTED_CACHE_VERSION: str | None = None
+    # CRSP name-history extract (crsp.dsenames columns: permno, ticker, shrcls,
+    # namedt, nameendt, shrcd, exchcd). With it, each membership interval is
+    # resolved to the PERMNO that was the member; licensed, kept outside Git.
+    CRSP_NAMES_PATH: str | None = None
 
     # Strategy core
     STRATEGY_MODE: str = "constituent_sma"
@@ -120,7 +127,8 @@ class BacktestConfig:
     USE_DYNAMIC_CASH_RATE: bool = True
     CASH_RATE_SOURCE: str = "DGS3MO"
     CASH_RATE_FALLBACK_SOURCE: str = "DTB3"
-    CASH_RATE_DAY_COUNT: str = "ACT/360"
+    # DGS3MO is a bond-equivalent yield, quoted on a 365-day year
+    CASH_RATE_DAY_COUNT: str = "ACT/365"
     CASH_RATE_AS_OF_DATE: str = "today"
 
     # Reporting
@@ -260,6 +268,8 @@ def load_config() -> BacktestConfig:
         OFFLINE_MODE=offline_raw == "1",
         CIZ_TERMINAL_RETURNS_PATH=os.getenv("CIZ_TERMINAL_RETURNS_PATH"),
         CIZ_TERMINAL_METADATA_PATH=os.getenv("CIZ_TERMINAL_METADATA_PATH"),
+        CIZ_CORRECTED_CACHE_VERSION=os.getenv("CIZ_CORRECTED_CACHE_VERSION") or None,
+        CRSP_NAMES_PATH=os.getenv("CRSP_NAMES_PATH") or None,
         CRSP_API_KEY=os.getenv("CRSP_API_KEY"),
         CRSP_USERNAME=os.getenv("CRSP_USERNAME"),
         WRDS_USERNAME=os.getenv("WRDS_USERNAME"),
@@ -274,13 +284,21 @@ def load_config() -> BacktestConfig:
     return cfg
 
 
+# credentials and account names: never hashed or written to run manifests
+SECRET_CONFIG_FIELDS = frozenset(
+    {"CRSP_API_KEY", "CRSP_USERNAME", "WRDS_USERNAME", "WRDS_PASSWORD", "FRED_API_KEY"}
+)
+
+
+def public_config_dict(config: BacktestConfig) -> dict[str, Any]:
+    """Return config fields that are safe to persist, without credentials."""
+    return {k: v for k, v in vars(config).items() if k not in SECRET_CONFIG_FIELDS}
+
+
 def config_hash(config: BacktestConfig) -> str:
     """Compute a stable hash for config values (excluding secrets)."""
     payload: dict[str, Any] = dataclasses.asdict(config)
-    payload.pop("CRSP_API_KEY", None)
-    payload.pop("CRSP_USERNAME", None)
-    payload.pop("WRDS_USERNAME", None)
-    payload.pop("WRDS_PASSWORD", None)
-    payload.pop("FRED_API_KEY", None)
+    for name in SECRET_CONFIG_FIELDS:
+        payload.pop(name, None)
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(serialized).hexdigest()

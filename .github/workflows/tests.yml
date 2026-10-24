@@ -34,5 +34,5 @@ jobs:
       - name: Verify committed schedule tables
         run: python run_schedule_audit.py --check
 
-      - name: Verify corrected reports from committed daily returns
+      - name: Verify corrected reports from committed portfolio returns
         run: python verify_corrected_reports.py

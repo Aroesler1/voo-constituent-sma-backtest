@@ -22,9 +22,11 @@ output/
 # run logs may contain vendor API tokens in error URLs
 logs/
 
+# licensed CRSP name-history extract used by quantify_contamination.py
 data/universe/dsenames.parquet
-output/
 
-# Cross-agent working notes. Kept locally, not published: it is scratch context
-# for whoever picks the work up next, not part of the repo.
+# Test caches
+.pytest_cache/
+
+# Local working notes, not published
 handoff.md

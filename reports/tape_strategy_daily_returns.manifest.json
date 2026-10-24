@@ -1,0 +1,33 @@
+{
+  "artifact_file": "tape_strategy_daily_returns.csv.gz",
+  "artifact_sha256": "9091de78e4ca7d17dfbfcc6aff2608b0fa905179a691b5fd6f5ee7009a487907",
+  "ciz_terminal_source": "corrected_cache:terminal-v3-7fe0edc5a632",
+  "compressed_bytes": 156592,
+  "content": "portfolio-level daily simple returns",
+  "date_column": "date",
+  "first_date": "1996-01-02",
+  "last_date": "2024-12-31",
+  "metric_policy": {
+    "first_row_is_start": true,
+    "geometric_sharpe_cash_rate_annual": {
+      "legacy_dsf": 0.02,
+      "v2_ciz": 0.02
+    },
+    "periods_per_year": 252.0,
+    "strategy_gap_threshold_bps": 1.0
+  },
+  "return_columns": {
+    "legacy_strategy_return": {
+      "portfolio": "constituent_sma200_semi_monthly",
+      "source_label": "legacy_dsf:constituent_sma200:semi_monthly",
+      "tape": "legacy_dsf"
+    },
+    "v2_strategy_return": {
+      "portfolio": "constituent_sma200_semi_monthly",
+      "source_label": "v2_ciz:constituent_sma200:semi_monthly",
+      "tape": "v2_ciz"
+    }
+  },
+  "rows": 7300,
+  "schema_version": 2
+}

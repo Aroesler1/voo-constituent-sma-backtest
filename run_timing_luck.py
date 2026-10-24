@@ -34,13 +34,13 @@ import pandas as pd
 from backtest_engine import run_buy_and_hold, run_constituent_backtest
 from config import BacktestConfig, load_config
 from metrics import compute_metrics
-from panel import BacktestPanel, build_panel, extract_adjusted_series
+from panel import BacktestPanel, active_mask_for_length, build_panel, extract_adjusted_series
 from report_evidence import (
     CONTROL_DAILY_NAME,
     CONTROL_MANIFEST_NAME,
-    committed_report_path,
-    write_daily_evidence,
-    write_manifest,
+    CONTROL_PUBLIC_MANIFEST_NAME,
+    CONTROL_PUBLIC_NAME,
+    write_evidence,
 )
 from spread_edge import edge_spread_series
 from statistics_mt import deflated_sharpe, per_period_sharpe, romano_wolf_stepdown
@@ -161,15 +161,7 @@ def run_schedule_sweep(
 
     for length in sma_lengths:
         LOGGER.info("Timing-luck sweep: building signal for SMA %s.", length)
-        sma = compute_sma_matrix(panel.close_df, int(length))
-        active = generate_active_mask(
-            prices=panel.close_df,
-            sma=sma,
-            signal_type=config.SIGNAL_TYPE,
-            entry_band_bps=config.ENTRY_BAND_BPS,
-            exit_band_bps=config.EXIT_BAND_BPS,
-        )
-        del sma
+        active = active_mask_for_length(panel, int(length), config)
         gc.collect()
 
         for schedule in schedules:
@@ -229,8 +221,8 @@ def run_schedule_sweep(
 # --------------------------------------------------------------------------
 
 
-def _benchmark_ohlc(panel: BacktestPanel, ticker: str) -> pd.DataFrame:
-    """Adjusted OHLC for a benchmark ETF, on the strategy trading calendar."""
+def _benchmark_ohlc(panel: BacktestPanel, ticker: str, *, history: bool = False) -> pd.DataFrame:
+    """Adjusted OHLC for a benchmark ETF, on the trading or the signal-history calendar."""
     raw = panel.spy_daily if ticker == "SPY" else panel.voo_daily
     frame = pd.DataFrame(
         {
@@ -238,7 +230,7 @@ def _benchmark_ohlc(panel: BacktestPanel, ticker: str) -> pd.DataFrame:
             for field in ("open", "high", "low", "close")
         }
     )
-    return frame.reindex(panel.trading_index)
+    return frame.reindex(panel.history_index if history else panel.trading_index)
 
 
 def index_spread_bps(panel: BacktestPanel, config: BacktestConfig) -> tuple[pd.Series, dict[str, Any]]:
@@ -253,9 +245,12 @@ def index_spread_bps(panel: BacktestPanel, config: BacktestConfig) -> tuple[pd.S
     right direction for a test whose conclusion is that the index-level rule
     still loses.
     """
-    spy = _benchmark_ohlc(panel, "SPY")
+    # estimated on the full history and then trimmed, so the 126-day EDGE
+    # window is filled before the sample starts
+    spy = _benchmark_ohlc(panel, "SPY", history=True)
     spy_spread = edge_spread_series(spy["open"], spy["high"], spy["low"], spy["close"]) * 10_000.0
     spy_spread = spy_spread.clip(lower=float(config.SPREAD_FLOOR_BPS), upper=float(config.SPREAD_CAP_BPS))
+    spy_spread = spy_spread.reindex(panel.trading_index)
 
     notes: dict[str, Any] = {
         "instrument": "SPY",
@@ -268,7 +263,7 @@ def index_spread_bps(panel: BacktestPanel, config: BacktestConfig) -> tuple[pd.S
         # 1998 to 2003 before the Vanguard ETF listed in 2010, and the name
         # history admits both. Truncating at the ETF's inception keeps the
         # cross-check on the ETF rather than on a spliced series.
-        voo = _benchmark_ohlc(panel, "VOO")
+        voo = _benchmark_ohlc(panel, "VOO", history=True)
         voo = voo.loc[voo.index >= pd.Timestamp(config.VOO_INCEPTION)].dropna(how="all")
         voo_spread = edge_spread_series(voo["open"], voo["high"], voo["low"], voo["close"]) * 10_000.0
         voo_spread = voo_spread.clip(lower=float(config.SPREAD_FLOOR_BPS), upper=float(config.SPREAD_CAP_BPS))
@@ -309,14 +304,19 @@ def run_index_level_rule(
     returns = pd.DataFrame({"SP500TR": close.pct_change(fill_method=None).fillna(0.0)})
     membership = pd.DataFrame(True, index=price.index, columns=price.columns)
 
-    sma = compute_sma_matrix(price, int(length))
+    # same signal history as the constituent rule: the average is defined on
+    # the first sample day rather than after a cash warm-up
+    history_price = pd.DataFrame(
+        {"SP500TR": _benchmark_ohlc(panel, "SPY", history=True)["close"].astype(float)}
+    )
+    sma = compute_sma_matrix(history_price, int(length))
     active = generate_active_mask(
-        prices=price,
+        prices=history_price,
         sma=sma,
         signal_type=config.SIGNAL_TYPE,
         entry_band_bps=config.ENTRY_BAND_BPS,
         exit_band_bps=config.EXIT_BAND_BPS,
-    )
+    ).reindex(price.index)
 
     price.attrs["open_df"] = pd.DataFrame({"SP500TR": index_ohlc["open"].astype(float)})
     price.attrs["spread_bps_est"] = pd.DataFrame({"SP500TR": spread_bps.reindex(price.index)})
@@ -347,15 +347,7 @@ def run_constituent_rule(
     schedule: EvaluationSchedule,
 ) -> dict[str, Any]:
     """Run one SMA rule across the constituent universe."""
-    sma = compute_sma_matrix(panel.close_df, int(length))
-    active = generate_active_mask(
-        prices=panel.close_df,
-        sma=sma,
-        signal_type=config.SIGNAL_TYPE,
-        entry_band_bps=config.ENTRY_BAND_BPS,
-        exit_band_bps=config.EXIT_BAND_BPS,
-    )
-    del sma
+    active = active_mask_for_length(panel, int(length), config)
     gc.collect()
     result = run_constituent_backtest(
         price_df=panel.close_df,
@@ -495,6 +487,17 @@ def _annualized_arithmetic_sharpe(returns: pd.Series, cash: pd.Series) -> float:
     return float(excess.mean() / sd * np.sqrt(252.0))
 
 
+def held_out_cash_rate(panel: BacktestPanel, config: BacktestConfig) -> float:
+    """Mean annual cash yield over the held-out half of the sample."""
+    dates = pd.DatetimeIndex(panel.trading_index)
+    evaluation_dates = dates[dates > dates[len(dates) // 2]]
+    if panel.cash_curve is not None:
+        annual = panel.cash_curve.reindex(dates).ffill().shift(1).fillna(config.CASH_RATE_ANNUAL)
+    else:
+        annual = pd.Series(config.CASH_RATE_ANNUAL, index=dates)
+    return float(annual.loc[evaluation_dates].mean())
+
+
 def run_vol_managed_control(
     panel: BacktestPanel,
     config: BacktestConfig,
@@ -542,15 +545,26 @@ def run_vol_managed_control(
         "cash_return": cash_daily.loc[evaluation_dates].rename("cash_return")
     }
 
+    # the held-out geometric Sharpe subtracts the held-out cash yield, not the
+    # full-sample average
+    held_out_cash = float(annual_cash.loc[evaluation_dates].mean())
+
     def _row(**kwargs: Any) -> dict[str, Any]:
         rets = kwargs["rets"].reindex(evaluation_dates)
-        equity = (1.0 + rets).cumprod() * float(config.INITIAL_CAPITAL)
+        # the curve starts at train_end, so the first held-out return compounds
+        # too; starting it after day one dropped that return from CAGR and drawdown
+        equity = pd.concat(
+            [
+                pd.Series([1.0], index=pd.DatetimeIndex([train_end])),
+                (1.0 + rets).cumprod(),
+            ]
+        ) * float(config.INITIAL_CAPITAL)
         met = compute_metrics(
             equity,
             rets,
             pd.DataFrame(),
             pd.Series(1, index=equity.index, dtype="Int64"),
-            panel.effective_cash_rate,
+            held_out_cash,
         )
         return {
             "leg": kwargs["leg"],
@@ -700,7 +714,7 @@ def main() -> None:
     if "2" in parts:
         LOGGER.info("=== Part 2: index versus stock ===")
         spread_bps, spread_notes = index_spread_bps(panel, config)
-        pd.DataFrame([spread_notes]).to_csv(out_dir / "index_spread_notes.csv", index=False)
+        _write_table(pd.DataFrame([spread_notes]), out_dir, "index_spread_notes.csv")
         LOGGER.info("Index spread assumption: %s", spread_notes)
 
         levels = run_index_vs_stock(panel, config, lengths, spread_bps)
@@ -769,12 +783,6 @@ def main() -> None:
         daily.index.name = "date"
         daily = daily.reset_index()
         daily["date"] = pd.to_datetime(daily["date"]).dt.strftime("%Y-%m-%d")
-        artifact = write_daily_evidence(
-            daily,
-            output_dir=out_dir,
-            report_dir=REPORTS_DIR,
-            name=CONTROL_DAILY_NAME,
-        )
         source_labels = {
             "cash_return": {
                 "source_label": "cash_sleeve:elapsed_calendar_day_return",
@@ -790,35 +798,42 @@ def main() -> None:
                 "variant": row["variant"],
                 "description": row["description"],
             }
-        write_manifest(
-            {
-                **artifact,
-                "schema_version": 1,
-                "content": "portfolio-level daily simple returns only",
-                "date_column": "date",
-                "cash_return_column": "cash_return",
-                "return_columns": source_labels,
-                "metric_policy": {
-                    "periods_per_year": 252.0,
-                    "geometric_sharpe_cash_rate_annual": (
-                        panel.effective_cash_rate
-                    ),
-                    "arithmetic_sharpe_cash_return_column": "cash_return",
-                },
+        manifest_fields = {
+            "schema_version": 2,
+            "content": "portfolio-level daily simple returns",
+            "date_column": "date",
+            "cash_return_column": "cash_return",
+            "metric_policy": {
+                "periods_per_year": 252.0,
+                "first_row_is_start": False,
+                "geometric_sharpe_cash_rate_annual": held_out_cash_rate(panel, config),
+                "arithmetic_sharpe_cash_return_column": "cash_return",
             },
-            output_dir=out_dir,
-            report_dir=REPORTS_DIR,
-            name=CONTROL_MANIFEST_NAME,
+        }
+        # the index leg is SPY's CRSP return series (and overlays on it), so the
+        # full file stays local; the committed copy has the constituent legs
+        write_evidence(
+            daily,
+            directory=out_dir / "evidence",
+            name=CONTROL_DAILY_NAME,
+            manifest_name=CONTROL_MANIFEST_NAME,
+            return_columns=source_labels,
+            manifest_fields=manifest_fields,
         )
-        control["daily_returns_path"] = committed_report_path(CONTROL_DAILY_NAME)
+        write_evidence(
+            daily,
+            directory=REPORTS_DIR,
+            name=CONTROL_PUBLIC_NAME,
+            manifest_name=CONTROL_PUBLIC_MANIFEST_NAME,
+            return_columns=source_labels,
+            manifest_fields=manifest_fields,
+            columns=[c for c in daily.columns if c != "date" and not c.startswith("index__")],
+        )
         control["daily_return_column"] = control.apply(
             lambda r: f"{r['leg']}__{r['variant']}_return",
             axis=1,
         )
         control["cash_return_column"] = "cash_return"
-        control["daily_returns_manifest_path"] = committed_report_path(
-            CONTROL_MANIFEST_NAME
-        )
         _write_table(control, out_dir, "vol_managed_control.csv")
         LOGGER.info("Part 3 control:\n%s", control.to_string(index=False))
 

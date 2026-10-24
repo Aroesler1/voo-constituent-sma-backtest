@@ -11,7 +11,7 @@ rebalance on. Their follow-up with Braun, "Rebalance Timing Luck: The (Dumb)
 Luck of Smart Beta" (SSRN 3673910, 2020), measures it above 100 bps annualised
 for long-only factor indices.
 
-This module enumerates the 27 schedules the brief asks for (1 daily + 5 weekly
+This module enumerates 27 schedules (1 daily + 5 weekly
 + 21 monthly) and runs the SMA sweep against every one of them. It also carries
 ``HEADLINE_SCHEDULE``, the semi-monthly rule ``main.py`` reports, which is not
 one of the 27: semi-monthly fires twice a month, so it is a frequency the anchor
@@ -22,7 +22,7 @@ Anchor convention. Both the weekly and the monthly anchors are **trading-day
 ordinals**, not calendar weekdays or calendar days: weekly variant *k* rebalances
 on the k-th trading day of each week, monthly variant *n* on the n-th trading
 day of each month. In a full five-day week the k-th trading day is the k-th
-weekday, so the weekly leg matches the brief's "each of the five weekdays"
+weekday, so the weekly leg covers each of the five weekdays
 whenever no holiday intervenes; in a short week it still fires exactly once.
 That matters because the point of the sweep is to isolate *which* day, holding
 *how often* fixed. Calendar-weekday anchors would silently drop the Monday

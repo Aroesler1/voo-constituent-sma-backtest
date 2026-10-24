@@ -176,6 +176,30 @@ def test_post_delist_ciz_daily_row_is_restored_without_prior_day_compounding():
     assert out["terminal_return_applied"].iloc[-1]
 
 
+def test_restored_row_does_not_overwrite_a_row_of_a_date_filtered_slice():
+    # a cache slice filtered by date keeps its original labels (here 2..5), so
+    # appending at label len(out) == 4 used to overwrite a real trading day
+    daily = normalize_v2_daily(_v2_raw_from_legacy(_legacy_raw()))
+    sliced = daily.iloc[2:].copy()
+    event_date = sliced["date"].iloc[-1] + pd.offsets.BDay(1)
+    events = pd.DataFrame(
+        {"permno": [12345], "event_date": [event_date], "terminal_return": [-0.60]}
+    )
+
+    out = apply_terminal_outcomes(
+        sliced, events, return_semantics="included_in_dlyret",
+        end=event_date.date().isoformat(),
+    )
+
+    assert len(out) == len(sliced) + 1
+    assert list(out["date"]) == list(sliced["date"]) + [event_date]
+    np.testing.assert_allclose(
+        out["total_return"].iloc[:-1].to_numpy(dtype=float),
+        sliced["total_return"].to_numpy(dtype=float),
+    )
+    assert out["total_return"].iloc[-1] == pytest.approx(-0.60)
+
+
 def test_terminal_event_does_not_create_duplicate_ticker_date():
     daily = normalize_v2_daily(_v2_raw_from_legacy(_legacy_raw()))
     daily.loc[daily.index[:3], "permno"] = 99999
@@ -319,3 +343,38 @@ def test_comparison_excludes_days_with_different_permanent_identifiers():
     assert out["n_comparable_days"] == 1
     assert out["n_identity_mismatch_days"] == 1
     assert out["n_altered_days"] == 0
+
+
+def test_offline_reuse_of_corrected_caches_never_mixes_in_uncorrected_ones(tmp_path):
+    from crsp_v2 import (  # noqa: PLC0415
+        fetch_crsp_v2_batch_prices,
+        terminal_outcomes_from_corrected_cache,
+    )
+
+    version = "terminal-v3-0123456789ab"
+    start, end = "1993-01-29", "2024-12-31"
+    corrected = tmp_path / "crsp_v2_versioned" / version
+    corrected.mkdir(parents=True)
+    frame = normalize_v2_daily(_v2_raw_from_legacy(_legacy_raw()))
+    frame["terminal_return"] = np.nan
+    frame.loc[frame.index[-1], "terminal_return"] = -0.4
+    frame["legacy_event_date"] = pd.NaT
+    frame.to_parquet(corrected / f"crspv2_AAA_{start}_{end}.parquet", index=False)
+    # an uncorrected frozen cache for another ticker must not be served
+    frozen = tmp_path / "crsp_v2"
+    frozen.mkdir()
+    frame.to_parquet(frozen / f"crspv2_BBB_{start}_{end}.parquet", index=False)
+
+    cfg = BacktestConfig(CACHE_DIR=str(tmp_path), OFFLINE_MODE=True, CIZ_CORRECTED_CACHE_VERSION=version)
+    out = fetch_crsp_v2_batch_prices(["AAA", "BBB"], start, end, config=cfg)
+    assert set(out) == {"AAA"}
+
+    events = terminal_outcomes_from_corrected_cache(cfg, start, end)
+    assert events[["permno", "terminal_return"]].values.tolist() == [[12345, -0.4]]
+
+
+def test_corrected_cache_version_must_name_a_verified_extract():
+    from crsp_v2 import validate_corrected_cache_version  # noqa: PLC0415
+
+    with pytest.raises(ValueError):
+        validate_corrected_cache_version("terminal-v3-latest")

@@ -233,6 +233,15 @@ def run_constituent_backtest(
         open_px = close_px.copy()
         use_open_execution = False
 
+    # raw CRSP prices for the $5 investability filter and per-share fees. the
+    # close matrix is a total-return level, so a stock that split or paid
+    # dividends since 1993 shows a level far from its traded price
+    raw_attr = price_attrs.get("raw_close")
+    if isinstance(raw_attr, pd.DataFrame):
+        raw_close_px = raw_attr.reindex(index=dates, columns=common_cols).astype(float)
+    else:
+        raw_close_px = close_px
+
     adv_df = _extract_feature_df(
         price_attrs.get("adv_usd"),
         dates,
@@ -280,6 +289,7 @@ def run_constituent_backtest(
             continue
 
         close_prev = close_px.loc[prev_date].to_numpy(dtype=float)
+        raw_close_prev = raw_close_px.loc[prev_date].to_numpy(dtype=float)
         open_i = open_px.loc[date_i].to_numpy(dtype=float)
         adv_prev = adv_df.loc[prev_date].to_numpy(dtype=float)
 
@@ -303,7 +313,7 @@ def run_constituent_backtest(
         if use_open_execution:
             tradable &= np.isfinite(open_i) & (open_i > 0)
         if config.ENFORCE_INVESTABILITY_FILTER:
-            tradable &= close_prev >= float(config.MIN_PRICE_TO_TRADE)
+            tradable &= raw_close_prev >= float(config.MIN_PRICE_TO_TRADE)
             tradable &= np.nan_to_num(adv_prev, nan=0.0) >= float(config.MIN_ADV_USD_TO_TRADE)
 
         desired_active = tradable & signal_prev
@@ -323,21 +333,41 @@ def run_constituent_backtest(
                 current_w_open = np.zeros(n_assets, dtype=float)
 
             delta_w = target_w - current_w_open
+            # the no-trade band only damps small reweights of names that stay
+            # held. a full entry or a full exit always trades: with an absolute
+            # band, an equal weight below it (more than 400 active names) could
+            # never be bought, and a small position could never be sold when its
+            # signal turned off
+            reweight_only = (target_w > 0) & (current_w_open > 0)
             if float(config.REBALANCE_BUFFER_BPS) > 0:
                 buffer = float(config.REBALANCE_BUFFER_BPS) / 10000.0
-                delta_w[np.abs(delta_w) < buffer] = 0.0
+                delta_w[reweight_only & (np.abs(delta_w) < buffer)] = 0.0
 
             if float(config.MIN_TRADE_NOTIONAL_USD) > 0 and equity_open_before_cost > 0:
                 min_weight = float(config.MIN_TRADE_NOTIONAL_USD) / equity_open_before_cost
-                delta_w[np.abs(delta_w) < min_weight] = 0.0
+                delta_w[reweight_only & (np.abs(delta_w) < min_weight)] = 0.0
 
             target_w = np.clip(current_w_open + delta_w, 0.0, 1.0)
             target_cash_w = max(0.0, 1.0 - float(target_w.sum()))
             total_target = float(target_w.sum())
             if total_target > 1.0:
-                target_w = target_w / total_target
+                # positions left inside the band keep their weight; the names
+                # that trade anyway absorb the excess. rescaling every holding
+                # instead would trade every name a little, and the old code did
+                # that without charging for it
+                kept = reweight_only & (delta_w == 0.0)
+                moving = ~kept & (target_w > 0)
+                room = 1.0 - float(target_w[kept].sum())
+                moving_total = float(target_w[moving].sum())
+                if room > 0.0 and moving_total > 0.0:
+                    target_w[moving] *= room / moving_total
+                else:
+                    target_w = target_w / total_target
                 target_cash_w = 0.0
 
+            # turnover and trade direction come from the weights actually held
+            # after any rescaling, so every executed change is charged
+            delta_w = target_w - current_w_open
             turnover = np.abs(delta_w)
 
             exec_px = open_i if use_open_execution else close_prev
@@ -352,6 +382,10 @@ def run_constituent_backtest(
                 px = float(exec_px[j]) if pd.notna(exec_px[j]) and exec_px[j] > 0 else float(close_prev[j])
                 if not np.isfinite(px) or px <= 0:
                     px = 1.0
+                # share counts for per-share fees use the traded (raw) price
+                share_px = float(raw_close_prev[j])
+                if not np.isfinite(share_px) or share_px <= 0:
+                    share_px = px
                 direction = "BUY" if delta_w[j] > 0 else "SELL"
                 modeled_impact_notional = trade_notional
                 if config.RETAIL_ACCOUNT_MODE:
@@ -361,7 +395,7 @@ def run_constituent_backtest(
                 costs = _trade_cost_components(
                     trade_notional=trade_notional,
                     modeled_impact_notional=modeled_impact_notional,
-                    price=px,
+                    price=share_px,
                     adv_usd=float(adv_prev[j]),
                     sigma_20d=float(sigma_prev[j]),
                     spread_bps_est=float(spread_prev[j]),

@@ -131,3 +131,28 @@ def test_ciz_offline_miss_never_reaches_connection_helper(monkeypatch, tmp_path)
         "2020-01-31",
         config=cfg,
     ) == {}
+
+
+def test_persisted_config_never_carries_credentials():
+    import dataclasses
+
+    from config import (
+        SECRET_CONFIG_FIELDS,
+        BacktestConfig,
+        config_hash,
+        public_config_dict,
+    )
+
+    secrets = {name: f"fixture-{name.lower()}" for name in SECRET_CONFIG_FIELDS}
+    cfg = BacktestConfig(OFFLINE_MODE=True, **secrets)
+    persisted = public_config_dict(cfg)
+
+    # every credential-like field must be covered, not only the FRED key
+    credential_like = {
+        f.name for f in dataclasses.fields(BacktestConfig)
+        if any(word in f.name for word in ("KEY", "PASSWORD", "USERNAME", "TOKEN"))
+    }
+    assert credential_like <= SECRET_CONFIG_FIELDS
+    assert not set(persisted) & SECRET_CONFIG_FIELDS
+    assert not any(value in str(persisted) for value in secrets.values())
+    assert config_hash(cfg) == config_hash(BacktestConfig(OFFLINE_MODE=True))
